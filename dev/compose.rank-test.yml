@@ -1,0 +1,5 @@
+# Temporary local test module; not part of the production image.
+services:
+  nakama:
+    volumes:
+      - ./dev/rank_module:/nakama/data/modules:ro

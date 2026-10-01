@@ -16,7 +16,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/rtapi"
@@ -85,96 +84,21 @@ func (p *Pipeline) statusFollow(ctx context.Context, logger *zap.Logger, session
 
 	followUserIDs := make(map[uuid.UUID]struct{}, len(uniqueUserIDs)+len(uniqueUsernames))
 	foundUsernames := make(map[string]struct{}, len(uniqueUsernames))
-	if len(uniqueUsernames) == 0 {
-		ids := make([]uuid.UUID, 0, len(uniqueUserIDs))
-		for userID := range uniqueUserIDs {
-			ids = append(ids, userID)
-		}
-
-		// See if all the users exist.
-		query := "SELECT id FROM users WHERE id = ANY($1::UUID[])"
-		rows, err := p.db.QueryContext(ctx, query, ids)
+	{
+		users, err := statusFollowUsersMySQL(ctx, p.db, uniqueUserIDs, uniqueUsernames)
 		if err != nil {
 			logger.Error("Error checking users in status follow", zap.Error(err))
 			_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
-				Code:    int32(rtapi.Error_RUNTIME_EXCEPTION),
-				Message: "Could not check users",
+				Code: int32(rtapi.Error_RUNTIME_EXCEPTION), Message: "Could not check users",
 			}}}, true)
 			return false, nil
 		}
-		for rows.Next() {
-			var id string
-			if err = rows.Scan(&id); err != nil {
-				_ = rows.Close()
-				logger.Error("Error scanning users in status follow", zap.Error(err))
-				break
-			}
-			userID := uuid.FromStringOrNil(id)
-			if userID == uuid.Nil {
-				// Cannot follow the system user.
-				continue
-			}
-			followUserIDs[userID] = struct{}{}
-		}
-		_ = rows.Close()
-	} else {
-		query := "SELECT id, username FROM users WHERE "
-
-		params := make([]any, 0, 2)
-		ids := make([]uuid.UUID, 0, len(uniqueUserIDs))
-		for userID := range uniqueUserIDs {
-			ids = append(ids, userID)
-		}
-		if len(ids) != 0 {
-			params = append(params, ids)
-			query += fmt.Sprintf("id = ANY($%d::UUID[])", len(params))
-		}
-
-		usernames := make([]string, 0, len(uniqueUsernames))
-		for username := range uniqueUsernames {
-			usernames = append(usernames, username)
-		}
-		if len(uniqueUserIDs) != 0 {
-			query += " OR "
-		}
-		params = append(params, usernames)
-		query += fmt.Sprintf("username = ANY($%d::text[])", len(params))
-
-		// See if all the users exist.
-		rows, err := p.db.QueryContext(ctx, query, params...)
-		if err != nil {
-			logger.Error("Error checking users in status follow", zap.Error(err))
-			_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
-				Code:    int32(rtapi.Error_RUNTIME_EXCEPTION),
-				Message: "Could not check users",
-			}}}, true)
-			return false, nil
-		}
-		for rows.Next() {
-			var id string
-			var username string
-			if err := rows.Scan(&id, &username); err != nil {
-				_ = rows.Close()
-				logger.Error("Error scanning users in status follow", zap.Error(err))
-				_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
-					Code:    int32(rtapi.Error_RUNTIME_EXCEPTION),
-					Message: "Could not check users",
-				}}}, true)
-				return false, nil
-			}
-
-			// Mark the username as found.
+		for id, username := range users {
 			foundUsernames[username] = struct{}{}
-
-			userID := uuid.FromStringOrNil(id)
-			if userID == session.UserID() || userID == uuid.Nil {
-				// The user cannot follow themselves or the system user.
-				continue
+			if id != session.UserID() && !id.IsNil() {
+				followUserIDs[id] = struct{}{}
 			}
-
-			followUserIDs[userID] = struct{}{}
 		}
-		_ = rows.Close()
 	}
 
 	if l := len(uniqueUserIDs) + len(uniqueUsernames); len(followUserIDs) != l {

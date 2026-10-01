@@ -43,3 +43,24 @@ func Test_Permission(t *testing.T) {
 	assert.False(t, acl[console.AclResources_ACCOUNT_EXPORT.String()].Write)
 	assert.True(t, acl[console.AclResources_ACCOUNT_EXPORT.String()].Delete)
 }
+
+// These names must match the generated RPCs, not request message names or UI paths.
+func TestConsoleManagementRoutes(t *testing.T) {
+	for _, tt := range []struct {
+		method   string
+		resource console.AclResources
+		flag     PermissionLevel
+	}{
+		{"ListAuditLogsUsers", console.AclResources_AUDIT_LOG, PermissionRead},
+		{"ListAclTemplates", console.AclResources_ACL_TEMPLATE, PermissionRead},
+		{"SendNotification", console.AclResources_NOTIFICATION, PermissionWrite},
+		{"AddUser", console.AclResources_USER, PermissionWrite},
+	} {
+		t.Run(tt.method, func(t *testing.T) {
+			path := "/nakama.console.Console/" + tt.method
+			assert.True(t, CheckACL(path, NewPermission(tt.resource, tt.flag)))
+			assert.False(t, CheckACL(path, None()))
+			assert.False(t, CheckACL(path, NewPermission(console.AclResources_ACCOUNT, PermissionWrite)))
+		})
+	}
+}

@@ -356,69 +356,44 @@ func (ls *LocalLeaderboardScheduler) invokeCallback() {
 		case <-ls.ctx.Done():
 			return
 		case callback := <-ls.queue:
-			if callback.leaderboard != nil {
-				if callback.leaderboard.IsTournament() {
-					// Tournament, fetch most up-to-date info for size etc.
-					// Some processing is needed even if there is no runtime callback registered for tournament reset.
-					query := `SELECT
-id, sort_order, operator, reset_schedule, metadata, create_time,
-category, description, duration, end_time, max_size, max_num_score, title, size, start_time
-FROM leaderboard
-WHERE id = $1`
-					row := ls.db.QueryRowContext(ls.ctx, query, callback.id)
-					tournament, err := parseTournament(row, callback.t)
-					if err != nil {
-						ls.logger.Error("Error retrieving tournament to invoke reset callback", zap.Error(err), zap.String("id", callback.id))
-						continue
-					}
-
-					// Reset tournament size in DB to make it immediately usable for the next active period.
-					if _, err := ls.db.ExecContext(ls.ctx, "UPDATE leaderboard SET size = 0 WHERE id = $1", callback.id); err != nil {
-						ls.logger.Error("Could not reset leaderboard size", zap.Error(err), zap.String("id", callback.id))
-					}
-
-					if ls.fnTournamentReset != nil {
-						if err := ls.fnTournamentReset(ls.ctx, tournament, int64(tournament.EndActive), int64(tournament.NextReset)); err != nil {
-							ls.logger.Warn("Failed to invoke tournament reset callback", zap.Error(err))
-						}
-					}
-				} else {
-					// Leaderboard.
-					// fnLeaderboardReset cannot be nil here, if it was the callback would not be queued at all.
-					l := &api.Leaderboard{
-						Id:            callback.leaderboard.Id,
-						SortOrder:     uint32(callback.leaderboard.SortOrder),
-						Operator:      OperatorIntToEnum[callback.leaderboard.Operator],
-						PrevReset:     uint32(calculatePrevReset(callback.t, callback.leaderboard.StartTime, callback.leaderboard.ResetSchedule)),
-						NextReset:     uint32(callback.leaderboard.ResetSchedule.Next(callback.t).UTC().Unix()),
-						Metadata:      callback.leaderboard.Metadata,
-						CreateTime:    &timestamppb.Timestamp{Seconds: callback.leaderboard.CreateTime},
-						Authoritative: callback.leaderboard.Authoritative,
-					}
-					if err := ls.fnLeaderboardReset(ls.ctx, l, callback.ts); err != nil {
-						ls.logger.Warn("Failed to invoke leaderboard reset callback", zap.Error(err))
-					}
+			if callback.leaderboard == nil || callback.leaderboard.IsTournament() {
+				reset := callback.leaderboard != nil
+				prepare := tournamentCallbackMySQL
+				{
+					prepare = tournamentCallbackMySQL
 				}
-			} else {
-				query := `SELECT
-id, sort_order, operator, reset_schedule, metadata, create_time,
-category, description, duration, end_time, max_size, max_num_score, title, size, start_time
-FROM leaderboard
-WHERE id = $1`
-				row := ls.db.QueryRowContext(ls.ctx, query, callback.id)
-				tournament, err := parseTournament(row, callback.t)
+				tournament, err := prepare(ls.ctx, ls.db, callback.id, callback.t, reset)
 				if err != nil {
 					if !errors.Is(err, sql.ErrNoRows) {
-						// Do not log if tournament was deleted before it reached the scheduler here.
-						ls.logger.Error("Error retrieving tournament to invoke end callback", zap.Error(err), zap.String("id", callback.id))
+						ls.logger.Error("Error preparing tournament callback", zap.Error(err))
 					}
 					continue
 				}
-
-				// fnTournamentEnd cannot be nil here, if it was the callback would not be queued at all.
-				if err := ls.fnTournamentEnd(ls.ctx, tournament, int64(tournament.EndActive), int64(tournament.NextReset)); err != nil {
-					ls.logger.Warn("Failed to invoke tournament end callback", zap.Error(err))
+				if reset && ls.fnTournamentReset != nil {
+					err = ls.fnTournamentReset(ls.ctx, tournament, int64(tournament.EndActive), int64(tournament.NextReset))
 				}
+				if !reset && ls.fnTournamentEnd != nil {
+					err = ls.fnTournamentEnd(ls.ctx, tournament, int64(tournament.EndActive), int64(tournament.NextReset))
+				}
+				if err != nil {
+					ls.logger.Warn("Failed to invoke tournament callback", zap.Error(err))
+				}
+				continue
+			}
+			// Leaderboard.
+			// fnLeaderboardReset cannot be nil here, if it was the callback would not be queued at all.
+			l := &api.Leaderboard{
+				Id:            callback.leaderboard.Id,
+				SortOrder:     uint32(callback.leaderboard.SortOrder),
+				Operator:      OperatorIntToEnum[callback.leaderboard.Operator],
+				PrevReset:     uint32(calculatePrevReset(callback.t, callback.leaderboard.StartTime, callback.leaderboard.ResetSchedule)),
+				NextReset:     uint32(callback.leaderboard.ResetSchedule.Next(callback.t).UTC().Unix()),
+				Metadata:      callback.leaderboard.Metadata,
+				CreateTime:    &timestamppb.Timestamp{Seconds: callback.leaderboard.CreateTime},
+				Authoritative: callback.leaderboard.Authoritative,
+			}
+			if err := ls.fnLeaderboardReset(ls.ctx, l, callback.ts); err != nil {
+				ls.logger.Warn("Failed to invoke leaderboard reset callback", zap.Error(err))
 			}
 		}
 	}

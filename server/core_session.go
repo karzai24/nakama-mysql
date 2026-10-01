@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL session refresh.
 // Copyright 2021 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +21,7 @@ import (
 	"errors"
 
 	"github.com/gofrs/uuid/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -41,9 +42,12 @@ func SessionRefresh(ctx context.Context, logger *zap.Logger, db *sql.DB, config 
 	}
 
 	// Look for an existing account.
-	query := "SELECT username, disable_time FROM users WHERE id = $1 LIMIT 1"
+	query := ""
 	var dbUsername string
-	var dbDisableTime pgtype.Timestamptz
+	var dbDisableTime sql.NullTime
+	{
+		query = "SELECT username, disable_time FROM users WHERE id = ?"
+	}
 	err := db.QueryRowContext(ctx, query, userID).Scan(&dbUsername, &dbDisableTime)
 	if err != nil {
 		if err == sql.ErrNoRows {

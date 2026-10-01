@@ -15,16 +15,15 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
-	"encoding/gob"
+
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
+
 	"strconv"
 	"strings"
 	"time"
@@ -33,7 +32,7 @@ import (
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/iap"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -282,8 +281,9 @@ func ValidatePurchaseGoogle(ctx context.Context, logger *zap.Logger, db *sql.DB,
 		purchaseEnv = api.StoreEnvironment_SANDBOX
 	}
 
-	if gReceipt.PurchaseState != 0 {
-		// Do not accept cancelled or pending receipts.
+	if gResponse.PurchaseState != 0 || gReceipt.PurchaseState != 0 {
+		// The provider response is authoritative; never accept a client-claimed
+		// purchased state when Google reports cancelled or pending.
 		return nil, status.Error(codes.FailedPrecondition, fmt.Sprintf("Invalid Receipt. State: %d", gReceipt.PurchaseState))
 	}
 
@@ -578,63 +578,13 @@ func ValidatePurchaseSamsung(ctx context.Context, logger *zap.Logger, db *sql.DB
 }
 
 func GetPurchaseByTransactionId(ctx context.Context, logger *zap.Logger, db *sql.DB, transactionID string) (*api.ValidatedPurchase, error) {
-	var (
-		dbTransactionId string
-		dbUserId        uuid.UUID
-		dbStore         api.StoreProvider
-		dbCreateTime    pgtype.Timestamptz
-		dbUpdateTime    pgtype.Timestamptz
-		dbPurchaseTime  pgtype.Timestamptz
-		dbRefundTime    pgtype.Timestamptz
-		dbProductId     string
-		dbEnvironment   api.StoreEnvironment
-		dbRawResponse   string
-	)
 
-	err := db.QueryRowContext(ctx, `
-		SELECT
-			user_id,
-			store,
-			transaction_id,
-			create_time,
-			update_time,
-			purchase_time,
-			refund_time,
-			product_id,
-			environment,
-			raw_response
-		FROM purchase
-		WHERE transaction_id = $1
-`, transactionID).Scan(&dbUserId, &dbStore, &dbTransactionId, &dbCreateTime, &dbUpdateTime, &dbPurchaseTime, &dbRefundTime, &dbProductId, &dbEnvironment, &dbRawResponse)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// Not found
-			return nil, nil
-		}
-		logger.Error("Error getting purchase", zap.Error(err))
-		return nil, err
-	}
+	return scanPurchaseMySQL(db.QueryRowContext(ctx, purchaseSelectMySQL+" WHERE transaction_id = ?", transactionID))
 
-	suid := dbUserId.String()
-	if dbUserId.IsNil() {
-		suid = ""
-	}
-
-	return &api.ValidatedPurchase{
-		UserId:           suid,
-		ProductId:        dbProductId,
-		TransactionId:    dbTransactionId,
-		Store:            dbStore,
-		PurchaseTime:     timestamppb.New(dbPurchaseTime.Time),
-		CreateTime:       timestamppb.New(dbCreateTime.Time),
-		UpdateTime:       timestamppb.New(dbUpdateTime.Time),
-		Environment:      dbEnvironment,
-		RefundTime:       timestamppb.New(dbRefundTime.Time),
-		ProviderResponse: dbRawResponse,
-	}, nil
 }
 
 type purchasesListCursor struct {
+	Filter        string
 	TransactionId string
 	PurchaseTime  *timestamppb.Timestamp
 	UserId        string
@@ -644,218 +594,9 @@ type purchasesListCursor struct {
 }
 
 func ListPurchases(ctx context.Context, logger *zap.Logger, db *sql.DB, userID string, limit int, cursor string, after, before time.Time) (*api.PurchaseList, error) {
-	var incomingCursor *purchasesListCursor
-	if cursor != "" {
-		cb, err := base64.URLEncoding.DecodeString(cursor)
-		if err != nil {
-			return nil, ErrPurchasesListInvalidCursor
-		}
-		incomingCursor = &purchasesListCursor{}
-		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
-			return nil, ErrPurchasesListInvalidCursor
-		}
-		if userID != "" && userID != incomingCursor.UserId {
-			// userID filter was set and has changed, cursor is now invalid
-			return nil, ErrPurchasesListInvalidCursor
-		}
-		if !after.Equal(incomingCursor.After) {
-			return nil, ErrPurchasesListInvalidCursor
-		}
-		if !before.Equal(incomingCursor.Before) {
-			return nil, ErrPurchasesListInvalidCursor
-		}
-	}
 
-	query := `
-SELECT
-	user_id,
-	transaction_id,
-	product_id,
-	store,
-	raw_response,
-	purchase_time,
-	create_time,
-	update_time,
-	refund_time,
-	environment
-FROM
-	purchase`
+	return listPurchasesMySQL(ctx, db, userID, limit, cursor, after, before)
 
-	var order string
-	params := make([]any, 0, 7)
-
-	if incomingCursor != nil {
-		if incomingCursor.IsNext {
-			if userID == "" {
-				query += " WHERE (purchase_time, user_id, transaction_id) < ($1, $2, $3)"
-				order = " ORDER BY purchase_time DESC, user_id DESC, transaction_id DESC"
-			} else {
-				query += " WHERE user_id = $2 AND (purchase_time, user_id, transaction_id) < ($1, $2, $3)"
-				order = " ORDER BY purchase_time DESC, user_id DESC, transaction_id DESC"
-			}
-		} else {
-			if userID == "" {
-				query += " WHERE (purchase_time, user_id, transaction_id) > ($1, $2, $3)"
-				order = " ORDER BY purchase_time, user_id, transaction_id"
-			} else {
-				query += " WHERE user_id = $2 AND (purchase_time, user_id, transaction_id) > ($1, $2, $3)"
-				order = " ORDER BY purchase_time, user_id, transaction_id"
-			}
-		}
-		params = append(params, incomingCursor.PurchaseTime.AsTime(), incomingCursor.UserId, incomingCursor.TransactionId)
-	} else {
-		if userID == "" {
-			//query += " "
-			order = " ORDER BY purchase_time DESC, user_id DESC, transaction_id DESC"
-		} else {
-			query += " WHERE user_id = $1"
-			order = " ORDER BY purchase_time DESC, user_id DESC, transaction_id DESC"
-			params = append(params, userID)
-		}
-	}
-
-	if !after.IsZero() {
-		if len(params) == 0 {
-			params = append(params, after)
-			query += fmt.Sprintf(" WHERE purchase_time >= $%v", len(params))
-		} else {
-			params = append(params, after)
-			query += fmt.Sprintf(" AND purchase_time >= $%v", len(params))
-		}
-	}
-	if !before.IsZero() {
-		if len(params) == 0 {
-			params = append(params, before)
-			query += fmt.Sprintf(" WHERE purchase_time <= $%v", len(params))
-		} else {
-			params = append(params, before)
-			query += fmt.Sprintf(" AND purchase_time <= $%v", len(params))
-		}
-	}
-
-	// Add order to query.
-	query += order
-
-	// Add limit to query.
-	if limit > 0 {
-		params = append(params, limit+1)
-	} else {
-		params = append(params, 101) // Default limit to 100 purchases if not set
-	}
-	query += fmt.Sprintf(" LIMIT $%d", len(params))
-
-	rows, err := db.QueryContext(ctx, query, params...)
-	if err != nil {
-		logger.Error("Error retrieving purchases.", zap.Error(err))
-		return nil, err
-	}
-	defer rows.Close()
-
-	var nextCursor *purchasesListCursor
-	var prevCursor *purchasesListCursor
-	purchases := make([]*api.ValidatedPurchase, 0, limit)
-
-	var dbUserID uuid.UUID
-	var transactionId string
-	var productId string
-	var store api.StoreProvider
-	var rawResponse string
-	var purchaseTime pgtype.Timestamptz
-	var createTime pgtype.Timestamptz
-	var updateTime pgtype.Timestamptz
-	var refundTime pgtype.Timestamptz
-	var environment api.StoreEnvironment
-
-	for rows.Next() {
-		if len(purchases) >= limit {
-			nextCursor = &purchasesListCursor{
-				TransactionId: transactionId,
-				PurchaseTime:  timestamppb.New(purchaseTime.Time),
-				UserId:        dbUserID.String(),
-				IsNext:        true,
-				After:         after,
-				Before:        before,
-			}
-			break
-		}
-
-		if err = rows.Scan(&dbUserID, &transactionId, &productId, &store, &rawResponse, &purchaseTime, &createTime, &updateTime, &refundTime, &environment); err != nil {
-			logger.Error("Error retrieving purchases.", zap.Error(err))
-			return nil, err
-		}
-
-		suid := dbUserID.String()
-		if dbUserID.IsNil() {
-			suid = ""
-		}
-
-		purchase := &api.ValidatedPurchase{
-			UserId:           suid,
-			ProductId:        productId,
-			TransactionId:    transactionId,
-			Store:            store,
-			PurchaseTime:     timestamppb.New(purchaseTime.Time),
-			CreateTime:       timestamppb.New(createTime.Time),
-			UpdateTime:       timestamppb.New(updateTime.Time),
-			ProviderResponse: rawResponse,
-			Environment:      environment,
-			RefundTime:       timestamppb.New(refundTime.Time),
-		}
-
-		purchases = append(purchases, purchase)
-
-		if incomingCursor != nil && prevCursor == nil {
-			prevCursor = &purchasesListCursor{
-				TransactionId: transactionId,
-				PurchaseTime:  timestamppb.New(purchaseTime.Time),
-				UserId:        dbUserID.String(),
-				IsNext:        false,
-				After:         after,
-				Before:        before,
-			}
-		}
-	}
-	if err = rows.Err(); err != nil {
-		logger.Error("Error retrieving purchases", zap.Error(err))
-		return nil, err
-	}
-	_ = rows.Close()
-
-	if incomingCursor != nil && !incomingCursor.IsNext {
-		if nextCursor != nil && prevCursor != nil {
-			nextCursor, nextCursor.IsNext, prevCursor, prevCursor.IsNext = prevCursor, prevCursor.IsNext, nextCursor, nextCursor.IsNext
-		} else if nextCursor != nil {
-			nextCursor, prevCursor = nil, nextCursor
-			prevCursor.IsNext = !prevCursor.IsNext
-		} else if prevCursor != nil {
-			nextCursor, prevCursor = prevCursor, nil
-			nextCursor.IsNext = !nextCursor.IsNext
-		}
-
-		slices.Reverse(purchases)
-	}
-
-	var nextCursorStr string
-	if nextCursor != nil {
-		cursorBuf := new(bytes.Buffer)
-		if err := gob.NewEncoder(cursorBuf).Encode(nextCursor); err != nil {
-			logger.Error("Error creating purchases list cursor", zap.Error(err))
-			return nil, err
-		}
-		nextCursorStr = base64.URLEncoding.EncodeToString(cursorBuf.Bytes())
-	}
-
-	var prevCursorStr string
-	if prevCursor != nil {
-		cursorBuf := new(bytes.Buffer)
-		if err := gob.NewEncoder(cursorBuf).Encode(prevCursor); err != nil {
-			logger.Error("Error creating purchases list cursor", zap.Error(err))
-			return nil, err
-		}
-		prevCursorStr = base64.URLEncoding.EncodeToString(cursorBuf.Bytes())
-	}
-
-	return &api.PurchaseList{ValidatedPurchases: purchases, Cursor: nextCursorStr, PrevCursor: prevCursorStr}, nil
 }
 
 type storagePurchase struct {
@@ -873,100 +614,9 @@ type storagePurchase struct {
 }
 
 func upsertPurchases(ctx context.Context, db *sql.DB, purchases []*storagePurchase) ([]*storagePurchase, error) {
-	if len(purchases) < 1 {
-		return nil, errors.New("expects at least one receipt")
-	}
 
-	transactionIDsToPurchase := make(map[string]*storagePurchase)
+	return upsertPurchasesMySQL(ctx, db, purchases)
 
-	userIdParams := make([]uuid.UUID, 0, len(purchases))
-	storeParams := make([]api.StoreProvider, 0, len(purchases))
-	transactionIdParams := make([]string, 0, len(purchases))
-	productIdParams := make([]string, 0, len(purchases))
-	purchaseTimeParams := make([]time.Time, 0, len(purchases))
-	rawResponseParams := make([]string, 0, len(purchases))
-	environmentParams := make([]api.StoreEnvironment, 0, len(purchases))
-	refundTimeParams := make([]time.Time, 0, len(purchases))
-
-	for _, purchase := range purchases {
-		if purchase.refundTime.IsZero() {
-			purchase.refundTime = time.Unix(0, 0)
-		}
-		if purchase.rawResponse == "" {
-			purchase.rawResponse = "{}"
-		}
-		transactionIDsToPurchase[purchase.transactionId] = purchase
-
-		userIdParams = append(userIdParams, purchase.userID)
-		storeParams = append(storeParams, purchase.store)
-		transactionIdParams = append(transactionIdParams, purchase.transactionId)
-		productIdParams = append(productIdParams, purchase.productId)
-		purchaseTimeParams = append(purchaseTimeParams, purchase.purchaseTime)
-		rawResponseParams = append(rawResponseParams, purchase.rawResponse)
-		environmentParams = append(environmentParams, purchase.environment)
-		refundTimeParams = append(refundTimeParams, purchase.refundTime)
-	}
-
-	query := `
-INSERT INTO purchase
-	(
-		user_id,
-		store,
-		transaction_id,
-		product_id,
-		purchase_time,
-		raw_response,
-		environment,
-		refund_time
-	)
-SELECT unnest($1::uuid[]), unnest($2::smallint[]), unnest($3::text[]), unnest($4::text[]), unnest($5::timestamptz[]), unnest($6::jsonb[]), unnest($7::smallint[]), unnest($8::timestamptz[])
-ON CONFLICT
-	(transaction_id)
-DO UPDATE SET
-	refund_time = EXCLUDED.refund_time,
-	update_time = now()
-RETURNING
-	user_id,
-	transaction_id,
-	create_time,
-	update_time,
-	refund_time
-`
-
-	rows, err := db.QueryContext(ctx, query, userIdParams, storeParams, transactionIdParams, productIdParams, purchaseTimeParams, rawResponseParams, environmentParams, refundTimeParams)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		// Newly inserted purchases
-		var dbUserID uuid.UUID
-		var transactionId string
-		var createTime pgtype.Timestamptz
-		var updateTime pgtype.Timestamptz
-		var refundTime pgtype.Timestamptz
-		if err = rows.Scan(&dbUserID, &transactionId, &createTime, &updateTime, &refundTime); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		storedPurchase := transactionIDsToPurchase[transactionId]
-		storedPurchase.createTime = createTime.Time
-		storedPurchase.updateTime = updateTime.Time
-		storedPurchase.seenBefore = updateTime.Time.After(createTime.Time)
-		if refundTime.Time.Unix() != 0 {
-			storedPurchase.refundTime = refundTime.Time
-		}
-	}
-	_ = rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	storedPurchases := make([]*storagePurchase, 0, len(transactionIDsToPurchase))
-	for _, purchase := range transactionIDsToPurchase {
-		storedPurchases = append(storedPurchases, purchase)
-	}
-
-	return storedPurchases, nil
 }
 
 func parseMillisecondUnixTimestamp(t int64) time.Time {

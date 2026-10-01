@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL account lifecycle integration.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +22,7 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -62,6 +63,14 @@ WHERE`
 		query = query + fmt.Sprintf(" facebook_id = ANY($%d::text[])", counter)
 	}
 
+	{
+		canonical, err := canonicalUserIDsMySQL(ids)
+		if err != nil {
+			return nil, err
+		}
+		query, params = userLookupMySQL(canonical, usernames, fbIDs)
+	}
+
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Error retrieving user accounts.", zap.Error(err), zap.Strings("user_ids", ids), zap.Strings("usernames", usernames), zap.Strings("facebook_ids", fbIDs))
@@ -94,12 +103,7 @@ func GetRandomUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, statusR
 		return []*api.User{}, nil
 	}
 
-	query := `
-SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata,
-	apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
-FROM users
-WHERE id > $1
-LIMIT $2`
+	query := mysqlUserColumns + " WHERE id > ? ORDER BY id LIMIT ?"
 	rows, err := db.QueryContext(ctx, query, uuid.Must(uuid.NewV4()).String(), count)
 	if err != nil {
 		logger.Error("Error retrieving random user accounts.", zap.Error(err))
@@ -153,18 +157,17 @@ LIMIT $2`
 	return users, nil
 }
 
-func DeleteUser(ctx context.Context, tx *sql.Tx, userID uuid.UUID) (int64, error) {
-	res, err := tx.ExecContext(ctx, "DELETE FROM users WHERE id = $1", userID)
-	if err != nil {
-		return 0, err
-	}
-
-	return res.RowsAffected()
-}
-
 func BanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config, sessionCache SessionCache, sessionRegistry SessionRegistry, tracker Tracker, ids []uuid.UUID) error {
-	query := "UPDATE users SET disable_time = now() WHERE id = ANY($1::UUID[])"
-	_, err := db.ExecContext(ctx, query, ids)
+	query := ""
+	params := []any{ids}
+	{
+		if len(ids) == 0 {
+			return nil
+		}
+		query = "UPDATE users SET disable_time = CURRENT_TIMESTAMP(6) WHERE id IN (" + mysqlMarks(len(ids)) + ")"
+		params = mysqlUUIDArgs(ids)
+	}
+	_, err := db.ExecContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Error banning user accounts.", zap.Error(err), zap.Any("ids", ids))
 		return err
@@ -185,8 +188,16 @@ func BanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config
 }
 
 func UnbanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, sessionCache SessionCache, ids []uuid.UUID) error {
-	query := "UPDATE users SET disable_time = '1970-01-01 00:00:00 UTC' WHERE id = ANY($1::UUID[])"
-	_, err := db.ExecContext(ctx, query, ids)
+	query := ""
+	params := []any{ids}
+	{
+		if len(ids) == 0 {
+			return nil
+		}
+		query = "UPDATE users SET disable_time = '1970-01-01 00:00:00' WHERE id IN (" + mysqlMarks(len(ids)) + ")"
+		params = mysqlUUIDArgs(ids)
+	}
+	_, err := db.ExecContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Error unbanning user accounts.", zap.Error(err), zap.Any("ids", ids))
 		return err
@@ -198,16 +209,12 @@ func UnbanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, sessionCach
 }
 
 func UserExistsAndDoesNotBlock(ctx context.Context, db *sql.DB, checkUserID, blocksUserID uuid.UUID) (bool, error) {
-	var count int
-	err := db.QueryRowContext(ctx, `
-SELECT COUNT(id) FROM users
-WHERE id = $1::UUID AND NOT EXISTS (
-	SELECT state FROM user_edge
-	WHERE source_id = $1::UUID AND destination_id = $2::UUID AND state = 3
-)
-`, checkUserID, blocksUserID).Scan(&count)
+	{
+		var exists bool
+		err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE id = ? AND NOT EXISTS (SELECT 1 FROM user_edge WHERE source_id = ? AND destination_id = ? AND state = 3))", checkUserID, checkUserID, blocksUserID).Scan(&exists)
+		return exists, err
+	}
 
-	return count != 0, err
 }
 
 func convertUser(rows *sql.Rows) (*api.User, error) {
@@ -226,8 +233,8 @@ func convertUser(rows *sql.Rows) (*api.User, error) {
 	var gamecenter sql.NullString
 	var steam sql.NullString
 	var edgeCount int
-	var createTime pgtype.Timestamptz
-	var updateTime pgtype.Timestamptz
+	var createTime sql.NullTime
+	var updateTime sql.NullTime
 
 	err := rows.Scan(&id, &username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata,
 		&apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &edgeCount, &createTime, &updateTime)
@@ -264,8 +271,13 @@ func fetchUserID(ctx context.Context, db *sql.DB, usernames []string) ([]string,
 		return ids, nil
 	}
 
-	query := "SELECT id FROM users WHERE username = ANY($1::text[])"
-	rows, err := db.QueryContext(ctx, query, usernames)
+	query := ""
+	params := []any{usernames}
+	{
+		query = "SELECT id FROM users WHERE username IN (" + mysqlMarks(len(usernames)) + ")"
+		params = mysqlStringArgs(usernames)
+	}
+	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return ids, nil

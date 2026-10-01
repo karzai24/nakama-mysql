@@ -298,7 +298,7 @@ func fileCloseAux(L *LState, file *lFile) int {
 	}
 
 errreturn:
-	L.RaiseError(err.Error())
+	L.RaiseError("%s", err.Error())
 	return 0
 }
 
@@ -403,7 +403,7 @@ normalreturn:
 	return L.GetTop() - top
 
 errreturn:
-	L.RaiseError(err.Error())
+	L.RaiseError("%s", err.Error())
 	//L.Push(LNil)
 	//L.Push(LString(err.Error()))
 	return 2
@@ -474,7 +474,7 @@ func fileLinesIter(L *LState) int {
 			L.Push(LNil)
 			return 1
 		}
-		L.RaiseError(err.Error())
+		L.RaiseError("%s", err.Error())
 	}
 	L.Push(LString(string(buf)))
 	return 1
@@ -544,7 +544,7 @@ func ioInput(L *LState) int {
 	case LString:
 		file, err := newFile(L, nil, string(lv), os.O_RDONLY, 0600, false, true)
 		if err != nil {
-			L.RaiseError(err.Error())
+			L.RaiseError("%s", err.Error())
 		}
 		L.Get(UpvalueIndex(1)).(*LTable).RawSetInt(fileDefInIndex, file)
 		L.Push(file)
@@ -590,7 +590,7 @@ func ioLinesIter(L *LState) int {
 			L.Push(LNil)
 			return 1
 		}
-		L.RaiseError(err.Error())
+		L.RaiseError("%s", err.Error())
 	}
 	L.Push(LString(string(buf)))
 	return 1
@@ -721,7 +721,7 @@ func ioOutput(L *LState) int {
 	case LString:
 		file, err := newFile(L, nil, string(lv), os.O_WRONLY|os.O_CREATE, 0600, true, false)
 		if err != nil {
-			L.RaiseError(err.Error())
+			L.RaiseError("%s", err.Error())
 		}
 		L.Get(UpvalueIndex(1)).(*LTable).RawSetInt(fileDefOutIndex, file)
 		L.Push(file)

@@ -41,16 +41,29 @@ func (s *ConsoleServer) GetConfig(ctx context.Context, in *emptypb.Empty) (*cons
 	cfg.GetConsole().SigningKey = ObfuscationString
 
 	cfg.GetConsole().Password = ObfuscationString
+	cfg.GetMFA().StorageEncryptionKey = ObfuscationString
+	if cfg.GetConsole().MFA != nil {
+		cfg.GetConsole().MFA.StorageEncryptionKey = ObfuscationString
+	}
 	for i, address := range cfg.GetDatabase().Addresses {
-		rawURL := fmt.Sprintf("postgresql://%s", address)
+		rawURL := address
+		withScheme := strings.Contains(rawURL, "://")
+		if !withScheme {
+			rawURL = fmt.Sprintf("%s://%s", cfg.GetDatabase().Backend, address)
+		}
 		parsedURL, err := url.Parse(rawURL)
 		if err != nil {
 			logger.Error("Error parsing database address in config.", zap.Error(err))
 			return nil, status.Error(codes.Internal, "Error processing config.")
 		}
 		if parsedURL.User != nil {
-			if password, isSet := parsedURL.User.Password(); isSet {
-				cfg.GetDatabase().Addresses[i] = strings.ReplaceAll(address, parsedURL.User.Username()+":"+password, parsedURL.User.Username()+":"+ObfuscationString)
+			if _, isSet := parsedURL.User.Password(); isSet {
+				parsedURL.User = url.UserPassword(parsedURL.User.Username(), ObfuscationString)
+				redacted := parsedURL.String()
+				if !withScheme {
+					redacted = strings.TrimPrefix(redacted, parsedURL.Scheme+"://")
+				}
+				cfg.GetDatabase().Addresses[i] = redacted
 			}
 		}
 	}
@@ -99,21 +112,7 @@ func (s *ConsoleServer) GetConfig(ctx context.Context, in *emptypb.Empty) (*cons
 }
 
 func (s *ConsoleServer) DeleteAllData(ctx context.Context, in *emptypb.Empty) (*emptypb.Empty, error) {
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	query := `TRUNCATE TABLE users, user_edge, user_device, user_tombstone, wallet_ledger, storage, purchase,
-			subscription, notification, message, leaderboard, leaderboard_record, groups, group_edge, users_notes`
-	if _, err := s.db.ExecContext(ctx, query); err != nil {
-		logger.Debug("Could not cleanup data.", zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to truncate tables.")
-	}
-	// Setup System user
-	query = `INSERT INTO users (id, username)
-    VALUES ('00000000-0000-0000-0000-000000000000', '')
-    ON CONFLICT(id) DO NOTHING`
-	if _, err := s.db.ExecContext(ctx, query); err != nil {
-		logger.Debug("Error creating system user.", zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to setup the system user.")
-	}
-	logger.Info("All data cleaned up.")
-	return &emptypb.Empty{}, nil
+
+	return s.clearDataMySQL(ctx, false)
+
 }

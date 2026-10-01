@@ -23,7 +23,6 @@ import (
 	"errors"
 	"slices"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/heroiclabs/nakama-common/runtime"
@@ -32,8 +31,6 @@ import (
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/internal/cronexpr"
 
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -147,29 +144,35 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 			return nil, err
 		}
 
-		query := "SELECT owner_id, username, score, subscore, num_score, max_num_score, metadata, create_time, update_time FROM leaderboard_record WHERE leaderboard_id = $1 AND expiry_time = $2"
+		query := ""
 		if incomingCursor == nil {
 			if leaderboard.SortOrder == LeaderboardSortOrderAscending {
-				query += " ORDER BY score ASC, subscore ASC, owner_id ASC"
+
 			} else {
-				query += " ORDER BY score DESC, subscore DESC, owner_id DESC"
+
 			}
 		} else {
 			if (leaderboard.SortOrder == LeaderboardSortOrderAscending && incomingCursor.IsNext) || (leaderboard.SortOrder == LeaderboardSortOrderDescending && !incomingCursor.IsNext) {
 				// Ascending and next page == descending and previous page.
-				query += " AND (leaderboard_id, expiry_time, score, subscore, owner_id) > ($1, $2, $4, $5, $6) ORDER BY score ASC, subscore ASC, owner_id ASC"
+
 			} else {
 				// Ascending and previous page == descending and next page.
-				query += " AND (leaderboard_id, expiry_time, score, subscore, owner_id) < ($1, $2, $4, $5, $6) ORDER BY score DESC, subscore DESC, owner_id DESC"
+
 			}
 		}
-		query += " LIMIT $3"
-		params := make([]any, 0, 6)
+
+		params := make([]interface{}, 0, 6)
 		params = append(params, leaderboardId, time.Unix(expiryTime, 0).UTC(), limitNumber+1)
 		if incomingCursor != nil {
 			params = append(params, incomingCursor.Score, incomingCursor.Subscore, incomingCursor.OwnerId)
 		}
 
+		{
+			query, params, err = leaderboardPageMySQL(leaderboardId, expiryTime, limitNumber, leaderboard.SortOrder == LeaderboardSortOrderAscending, incomingCursor)
+			if err != nil {
+				return nil, err
+			}
+		}
 		rows, err := db.QueryContext(ctx, query, params...)
 		if err != nil {
 			logger.Error("Error listing leaderboard records", zap.Error(err))
@@ -190,8 +193,8 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 		var dbNumScore int32
 		var dbMaxNumScore int32
 		var dbMetadata string
-		var dbCreateTime pgtype.Timestamptz
-		var dbUpdateTime pgtype.Timestamptz
+		var dbCreateTime sql.NullTime
+		var dbUpdateTime sql.NullTime
 		for rows.Next() {
 			if len(records) >= limitNumber {
 				nextCursor = &leaderboardRecordListCursor{
@@ -254,6 +257,9 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 			}
 		}
 		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 
 		if incomingCursor != nil && !incomingCursor.IsNext {
 			// If this was a previous page listing, flip the results to their normal order and swap the cursors.
@@ -288,9 +294,15 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 
 	if len(ownerIds) != 0 {
 		params := []any{leaderboardId, time.Unix(expiryTime, 0).UTC(), ownerIds}
-		query := `SELECT owner_id, username, score, subscore, num_score, max_num_score, metadata, create_time, update_time
-FROM leaderboard_record
-WHERE leaderboard_id = $1 AND expiry_time = $2 AND owner_id = ANY($3)`
+		query := ""
+
+		{
+			var err error
+			query, params, err = leaderboardOwnersMySQL(leaderboardId, expiryTime, ownerIds)
+			if err != nil {
+				return nil, err
+			}
+		}
 
 		rows, err := db.QueryContext(ctx, query, params...)
 		if err != nil {
@@ -307,8 +319,8 @@ WHERE leaderboard_id = $1 AND expiry_time = $2 AND owner_id = ANY($3)`
 		var dbNumScore int32
 		var dbMaxNumScore int32
 		var dbMetadata string
-		var dbCreateTime pgtype.Timestamptz
-		var dbUpdateTime pgtype.Timestamptz
+		var dbCreateTime sql.NullTime
+		var dbUpdateTime sql.NullTime
 		for rows.Next() {
 			err = rows.Scan(&dbOwnerID, &dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime)
 			if err != nil {
@@ -339,6 +351,9 @@ WHERE leaderboard_id = $1 AND expiry_time = $2 AND owner_id = ANY($3)`
 			ownerRecords = append(ownerRecords, record)
 		}
 		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Sort owner records according to leaderboard ordering
@@ -413,201 +428,23 @@ func unmarshalLeaderboardRecordsListCursor(leaderboardId string, expiryTime int6
 }
 
 func LeaderboardRecordWrite(ctx context.Context, logger *zap.Logger, db *sql.DB, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, caller uuid.UUID, leaderboardId, ownerID, username string, score, subscore int64, metadata string, overrideOperator api.Operator) (*api.LeaderboardRecord, error) {
-	leaderboard := leaderboardCache.Get(leaderboardId)
-	if leaderboard == nil {
-		return nil, ErrLeaderboardNotFound
-	}
-
-	if leaderboard.Authoritative && caller != uuid.Nil {
-		return nil, ErrLeaderboardAuthoritative
-	}
-
-	expiryTime := int64(0)
-	if leaderboard.ResetSchedule != nil {
-		expiryTime = leaderboard.ResetSchedule.Next(time.Now().UTC()).UTC().Unix()
-	}
-
-	operator := leaderboard.Operator
-	if overrideOperator != api.Operator_NO_OVERRIDE {
-		switch overrideOperator {
-		case api.Operator_INCREMENT:
-			operator = LeaderboardOperatorIncrement
-		case api.Operator_SET:
-			operator = LeaderboardOperatorSet
-		case api.Operator_BEST:
-			operator = LeaderboardOperatorBest
-		case api.Operator_DECREMENT:
-			operator = LeaderboardOperatorDecrement
-		default:
-			return nil, ErrInvalidOperator
-		}
-	}
-
-	var opSQL string
-	var filterSQL string
-	var scoreDelta int64
-	var subscoreDelta int64
-	var scoreAbs int64
-	var subscoreAbs int64
-	switch operator {
-	case LeaderboardOperatorIncrement:
-		opSQL = "score = leaderboard_record.score + $8, subscore = leaderboard_record.subscore + $9"
-		filterSQL = " WHERE $8 <> 0 OR $9 <> 0"
-		scoreDelta = score
-		subscoreDelta = subscore
-		scoreAbs = score
-		subscoreAbs = subscore
-	case LeaderboardOperatorDecrement:
-		opSQL = "score = GREATEST(leaderboard_record.score - $8, 0), subscore = GREATEST(leaderboard_record.subscore - $9, 0)"
-		filterSQL = " WHERE $8 <> 0 OR $9 <> 0"
-		scoreDelta = score
-		subscoreDelta = subscore
-		scoreAbs = 0
-		subscoreAbs = 0
-	case LeaderboardOperatorSet:
-		opSQL = "score = $4, subscore = $5"
-		filterSQL = " WHERE leaderboard_record.score <> $4 OR leaderboard_record.subscore <> $5"
-		scoreDelta = score
-		subscoreDelta = subscore
-		scoreAbs = score
-		subscoreAbs = subscore
-	case LeaderboardOperatorBest:
-		fallthrough
-	default:
-		if leaderboard.SortOrder == LeaderboardSortOrderAscending {
-			// Lower score is better.
-			opSQL = "score = LEAST(leaderboard_record.score, $4), subscore = LEAST(leaderboard_record.subscore, $5)"
-			filterSQL = " WHERE leaderboard_record.score > $4 OR leaderboard_record.subscore > $5"
-		} else {
-			// Higher score is better.
-			opSQL = "score = GREATEST(leaderboard_record.score, $4), subscore = GREATEST(leaderboard_record.subscore, $5)"
-			filterSQL = " WHERE leaderboard_record.score < $4 OR leaderboard_record.subscore < $5"
-		}
-		scoreDelta = score
-		subscoreDelta = subscore
-		scoreAbs = score
-		subscoreAbs = subscore
-	}
-
-	query := `INSERT INTO leaderboard_record (leaderboard_id, owner_id, username, score, subscore, metadata, expiry_time)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, '{}'::JSONB), $7)
-            ON CONFLICT (owner_id, leaderboard_id, expiry_time)
-            DO UPDATE SET ` + opSQL + `, num_score = leaderboard_record.num_score + 1, metadata = COALESCE($6, leaderboard_record.metadata), username = COALESCE($3, leaderboard_record.username), update_time = now()` + filterSQL + `
-            RETURNING username, score, subscore, num_score, max_num_score, metadata, create_time, update_time`
-
-	params := make([]any, 0, 9)
-	params = append(params, leaderboardId, ownerID)
-	if username == "" {
-		params = append(params, nil)
-	} else {
-		params = append(params, username)
-	}
-	params = append(params, scoreAbs, subscoreAbs)
-	if metadata == "" {
-		params = append(params, nil)
-	} else {
-		params = append(params, metadata)
-	}
-	params = append(params, time.Unix(expiryTime, 0).UTC())
-	if operator == LeaderboardOperatorIncrement || operator == LeaderboardOperatorDecrement {
-		params = append(params, scoreDelta, subscoreDelta)
-	}
-
-	// Track if the database record actually updates or not.
-	var unchanged bool
-
-	var dbUsername sql.NullString
-	var dbScore int64
-	var dbSubscore int64
-	var dbNumScore int32
-	var dbMaxNumScore int32
-	var dbMetadata string
-	var dbCreateTime pgtype.Timestamptz
-	var dbUpdateTime pgtype.Timestamptz
-
-	err := db.QueryRowContext(ctx, query, params...).Scan(&dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime)
-
+	owner, err := uuid.FromString(ownerID)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if err != sql.ErrNoRows && !(errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "leaderboard_record_pkey")) {
-			logger.Error("Error writing leaderboard record", zap.Error(err))
-			return nil, err
-		}
-
-		// If no rows were returned then both of these criteria must have been met:
-		// 1. There was already a record for this leaderboard, user, and expiry time.
-		// 2. This new update did not meet the criteria to be stored, so no update
-		//    occurred. For example the new entry was not better in a "best" leaderboard.
-		// In this case the user's record is unchanged, and we can just read it as is.
-		query = "SELECT username, score, subscore, num_score, max_num_score, metadata, create_time, update_time FROM leaderboard_record WHERE leaderboard_id = $1 AND owner_id = $2 AND expiry_time = $3"
-		err = db.QueryRowContext(ctx, query, leaderboardId, ownerID, time.Unix(expiryTime, 0).UTC()).Scan(&dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime)
-		if err != nil {
-			logger.Error("Error after writing leaderboard record", zap.Error(err))
-			return nil, err
-		}
-		unchanged = true
+		return nil, err
 	}
 
-	var rank int64
-	if unchanged {
-		rank = rankCache.Get(leaderboardId, expiryTime, uuid.Must(uuid.FromString(ownerID)))
-	} else {
-		// Ensure we have the latest dbscore, dbsubscore if there was an update.
-		rank = rankCache.Insert(leaderboardId, leaderboard.SortOrder, dbScore, dbSubscore, dbNumScore, expiryTime, uuid.Must(uuid.FromString(ownerID)), leaderboard.EnableRanks)
-	}
+	return leaderboardRecordWriteMySQL(ctx, db, rankCache, caller, leaderboardId, owner, username, score, subscore, metadata, overrideOperator, false)
 
-	record := &api.LeaderboardRecord{
-		Rank:          rank,
-		LeaderboardId: leaderboardId,
-		OwnerId:       ownerID,
-		Score:         dbScore,
-		Subscore:      dbSubscore,
-		NumScore:      dbNumScore,
-		MaxNumScore:   uint32(dbMaxNumScore),
-		Metadata:      dbMetadata,
-		CreateTime:    &timestamppb.Timestamp{Seconds: dbCreateTime.Time.Unix()},
-		UpdateTime:    &timestamppb.Timestamp{Seconds: dbUpdateTime.Time.Unix()},
-	}
-	if dbUsername.Valid {
-		record.Username = &wrapperspb.StringValue{Value: dbUsername.String}
-	}
-	if expiryTime != 0 {
-		record.ExpiryTime = &timestamppb.Timestamp{Seconds: expiryTime}
-	}
-
-	return record, nil
 }
 
 func LeaderboardRecordDelete(ctx context.Context, logger *zap.Logger, db *sql.DB, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, caller uuid.UUID, leaderboardId, ownerID string) error {
-	leaderboard := leaderboardCache.Get(leaderboardId)
-	if leaderboard == nil || leaderboard.IsTournament() {
-		return ErrLeaderboardNotFound
-	}
 
-	if leaderboard.Authoritative && caller != uuid.Nil {
-		return ErrLeaderboardAuthoritative
-	}
+	return leaderboardRecordDeleteMySQL(ctx, db, rankCache, caller, leaderboardId, ownerID, false)
 
-	expiryTime := int64(0)
-	if leaderboard.ResetSchedule != nil {
-		expiryTime = leaderboard.ResetSchedule.Next(time.Now().UTC()).UTC().Unix()
-	}
-
-	query := "DELETE FROM leaderboard_record WHERE leaderboard_id = $1 AND owner_id = $2 AND expiry_time = $3"
-	_, err := db.ExecContext(
-		ctx, query, leaderboardId, ownerID, time.Unix(expiryTime, 0).UTC())
-	if err != nil {
-		logger.Error("Error deleting leaderboard record", zap.Error(err))
-		return err
-	}
-
-	rankCache.Delete(leaderboardId, expiryTime, uuid.Must(uuid.FromString(ownerID)))
-
-	return nil
 }
 
 func LeaderboardRecordReadAll(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID) ([]*api.LeaderboardRecord, error) {
-	query := "SELECT leaderboard_id, owner_id, username, score, subscore, num_score, max_num_score, metadata, create_time, update_time, expiry_time FROM leaderboard_record WHERE owner_id = $1"
+	query := "SELECT " + leaderboardRecordColumns + " FROM leaderboard_record WHERE owner_id = ?"
 	rows, err := db.QueryContext(ctx, query, userID.String())
 	if err != nil {
 		logger.Error("Error reading all leaderboard records for user", zap.String("user_id", userID.String()), zap.Error(err))
@@ -616,36 +453,6 @@ func LeaderboardRecordReadAll(ctx context.Context, logger *zap.Logger, db *sql.D
 	// rows.Close() called in parseLeaderboardRecords
 
 	return parseLeaderboardRecords(logger, rows)
-}
-
-func LeaderboardRecordsDeleteAll(ctx context.Context, logger *zap.Logger, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, tx *sql.Tx, userID uuid.UUID, currentTime int64) error {
-	query := "DELETE FROM leaderboard_record WHERE owner_id = $1 RETURNING leaderboard_id, expiry_time"
-	rows, err := tx.QueryContext(ctx, query, userID.String())
-	if err != nil {
-		logger.Error("Error deleting all leaderboard records for user", zap.String("user_id", userID.String()), zap.Error(err))
-		return err
-	}
-
-	var leaderboardId string
-	var expiryTime pgtype.Timestamptz
-	for rows.Next() {
-		if err := rows.Scan(&leaderboardId, &expiryTime); err != nil {
-			_ = rows.Close()
-			logger.Error("Error deleting all leaderboard records for user, failed to scan", zap.String("user_id", userID.String()), zap.Error(err))
-			return err
-		}
-
-		expiryUnix := expiryTime.Time.Unix()
-		if expiryUnix != 0 && expiryUnix <= currentTime {
-			// Expired ranks are handled by the rank cache itself.
-			continue
-		}
-
-		leaderboardRankCache.Delete(leaderboardId, expiryUnix, userID)
-	}
-	_ = rows.Close()
-
-	return nil
 }
 
 func LeaderboardRecordsHaystack(ctx context.Context, logger *zap.Logger, db *sql.DB, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, leaderboardId, cursor string, ownerID uuid.UUID, limit int, overrideExpiry int64) (*api.LeaderboardRecordList, error) {
@@ -723,15 +530,11 @@ func getLeaderboardRecordsHaystack(ctx context.Context, logger *zap.Logger, db *
 		var dbNumScore int32
 		var dbMaxNumScore int32
 		var dbMetadata string
-		var dbCreateTime pgtype.Timestamptz
-		var dbUpdateTime pgtype.Timestamptz
-		var dbExpiryTime pgtype.Timestamptz
+		var dbCreateTime sql.NullTime
+		var dbUpdateTime sql.NullTime
+		var dbExpiryTime sql.NullTime
 
-		findQuery := `SELECT leaderboard_id, owner_id, username, score, subscore, num_score, max_num_score, metadata, create_time, update_time, expiry_time
-		FROM leaderboard_record
-		WHERE owner_id = $1
-		AND leaderboard_id = $2
-		AND expiry_time = $3`
+		findQuery := "SELECT " + leaderboardRecordColumns + " FROM leaderboard_record WHERE owner_id = ? AND leaderboard_id = ? AND expiry_time = ?"
 		logger.Debug("Leaderboard haystack lookup", zap.String("query", findQuery))
 		err := db.QueryRowContext(ctx, findQuery, ownerID, leaderboardId, expiryTime).Scan(&dbLeaderboardID, &dbOwnerID, &dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime, &dbExpiryTime)
 		if err == sql.ErrNoRows {
@@ -762,23 +565,7 @@ func getLeaderboardRecordsHaystack(ctx context.Context, logger *zap.Logger, db *
 			ownerRecord.ExpiryTime = &timestamppb.Timestamp{Seconds: expiryTime}
 		}
 
-		query := `SELECT leaderboard_id, owner_id, username, score, subscore, num_score, max_num_score, metadata, create_time, update_time, expiry_time
-	FROM leaderboard_record
-	WHERE leaderboard_id = $1
-	AND expiry_time = $2`
-
-		// First half.
-		params := []any{leaderboardId, expiryTime, ownerRecord.Score, ownerRecord.Subscore, ownerID}
-		firstQuery := query
-		if sortOrder == LeaderboardSortOrderAscending {
-			// Lower score is better, but get in reverse order from current user to get those immediately above.
-			firstQuery += " AND (score, subscore, owner_id) < ($3, $4, $5) ORDER BY score DESC, subscore DESC, owner_id DESC"
-		} else {
-			// Higher score is better.
-			firstQuery += " AND (score, subscore, owner_id) > ($3, $4, $5) ORDER BY score ASC, subscore ASC, owner_id ASC"
-		}
-		firstParams := append(params, limit+1)
-		firstQuery += " LIMIT $6"
+		firstQuery, firstParams := leaderboardNeighborsMySQL(leaderboardId, expiryTime, ownerRecord.Score, ownerRecord.Subscore, ownerID, limit+1, sortOrder != LeaderboardSortOrderAscending)
 
 		firstRows, err := db.QueryContext(ctx, firstQuery, firstParams...)
 		if err != nil {
@@ -802,20 +589,11 @@ func getLeaderboardRecordsHaystack(ctx context.Context, logger *zap.Logger, db *
 		// We went 'up' on the leaderboard, so reverse the first half of records.
 		slices.Reverse(firstRecords)
 
-		secondQuery := query
-		if sortOrder == LeaderboardSortOrderAscending {
-			// Lower score is better.
-			secondQuery += " AND (score, subscore, owner_id) > ($3, $4, $5) ORDER BY score ASC, subscore ASC, owner_id ASC"
-		} else {
-			// Higher score is better.
-			secondQuery += " AND (score, subscore, owner_id) < ($3, $4, $5) ORDER BY score DESC, subscore DESC, owner_id DESC"
-		}
 		secondLimit := limit / 2
 		if l := len(firstRecords); l < secondLimit {
 			secondLimit = limit - l
 		}
-		secondParams := append(params, secondLimit+1)
-		secondQuery += " LIMIT $6"
+		secondQuery, secondParams := leaderboardNeighborsMySQL(leaderboardId, expiryTime, ownerRecord.Score, ownerRecord.Subscore, ownerID, secondLimit+1, sortOrder == LeaderboardSortOrderAscending)
 
 		secondRows, err := db.QueryContext(ctx, secondQuery, secondParams...)
 		if err != nil {
@@ -918,9 +696,9 @@ func parseLeaderboardRecords(logger *zap.Logger, rows *sql.Rows) ([]*api.Leaderb
 	var dbNumScore int32
 	var dbMaxNumScore int32
 	var dbMetadata string
-	var dbCreateTime pgtype.Timestamptz
-	var dbUpdateTime pgtype.Timestamptz
-	var dbExpiryTime pgtype.Timestamptz
+	var dbCreateTime sql.NullTime
+	var dbUpdateTime sql.NullTime
+	var dbExpiryTime sql.NullTime
 	for rows.Next() {
 		if err := rows.Scan(&dbLeaderboardID, &dbOwnerID, &dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime, &dbExpiryTime); err != nil {
 			logger.Error("Could not execute leaderboard records list query", zap.Error(err))
@@ -949,7 +727,7 @@ func parseLeaderboardRecords(logger *zap.Logger, rows *sql.Rows) ([]*api.Leaderb
 		records = append(records, record)
 	}
 
-	return records, nil
+	return records, rows.Err()
 }
 
 func calculateExpiryOverride(overrideExpiry int64, leaderboard *Leaderboard) (int64, bool) {
@@ -976,7 +754,8 @@ func disableLeaderboardRanks(ctx context.Context, logger *zap.Logger, db *sql.DB
 		return runtime.ErrLeaderboardNotFound
 	}
 
-	if _, err := db.ExecContext(ctx, "UPDATE leaderboard SET enable_ranks = false WHERE id = $1", id); err != nil {
+	query := "UPDATE leaderboard SET enable_ranks = false WHERE id = ?"
+	if _, err := db.ExecContext(ctx, query, id); err != nil {
 		logger.Error("failed to set leaderboard enable_ranks value", zap.Error(err))
 		return errors.New("failed to disable leaderboard ranks")
 	}

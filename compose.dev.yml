@@ -1,0 +1,61 @@
+# Local development only. Standalone Nakama MySQL-only release.
+name: nakama-mysql-dev
+services:
+  mysql:
+    # Permit deterministic schema triggers with binary logging in local development.
+    command: ["--log-bin-trust-function-creators=ON"]
+    image: mysql:8.4@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d
+    environment:
+      MYSQL_DATABASE: nakama
+      MYSQL_USER: nakama
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Run python3 dev/setup.py first}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Run python3 dev/setup.py first}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql --protocol=TCP -h 127.0.0.1 -u nakama -D nakama -e "SELECT 1" >/dev/null']
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 30
+  nakama:
+    image: nakama-mysql-dev:local
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        VERSION: 3.41.0-mysql-dev
+        COMMIT: ${NAKAMA_COMMIT:-local-working-tree}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      NAKAMA_DATABASE_BACKEND: mysql
+      NAKAMA_TELEMETRY: "0"
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Run python3 dev/setup.py first}
+      NAKAMA_SERVER_KEY: ${NAKAMA_SERVER_KEY:?Run python3 dev/setup.py first}
+      NAKAMA_SESSION_KEY: ${NAKAMA_SESSION_KEY:?Run python3 dev/setup.py first}
+      NAKAMA_REFRESH_KEY: ${NAKAMA_REFRESH_KEY:?Run python3 dev/setup.py first}
+      NAKAMA_CONSOLE_PASSWORD: ${NAKAMA_CONSOLE_PASSWORD:?Run python3 dev/setup.py first}
+      NAKAMA_HTTP_KEY: ${NAKAMA_HTTP_KEY:?Run python3 dev/setup.py first}
+      NAKAMA_CONSOLE_KEY: ${NAKAMA_CONSOLE_KEY:?Run python3 dev/setup.py first}
+    entrypoint: [tini, --, /bin/sh, -ec]
+    command:
+      - |
+        database_address="nakama:$$MYSQL_PASSWORD@mysql:3306/nakama?tls=false"
+        /nakama/nakama migrate up --database.backend "$$NAKAMA_DATABASE_BACKEND" --database.address "$$database_address"
+        exec /nakama/nakama --name nakama-local --runtime.http_key "$$NAKAMA_HTTP_KEY" --database.backend "$$NAKAMA_DATABASE_BACKEND" --database.address "$$database_address" --socket.server_key "$$NAKAMA_SERVER_KEY" --session.encryption_key "$$NAKAMA_SESSION_KEY" --session.refresh_encryption_key "$$NAKAMA_REFRESH_KEY" --console.username localadmin --console.password "$$NAKAMA_CONSOLE_PASSWORD" --console.signing_key "$$NAKAMA_CONSOLE_KEY"
+    ports:
+      - "127.0.0.1:7349:7349"
+      - "127.0.0.1:7350:7350"
+      - "127.0.0.1:7351:7351"
+    healthcheck:
+      test: [CMD, /nakama/nakama, healthcheck]
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 20
+volumes:
+  mysql_data:

@@ -44,7 +44,7 @@ func coResume(L *LState) int {
 	if L.G.CurrentThread == th {
 		msg := "can not resume a running thread"
 		if th.wrapped {
-			L.RaiseError(msg)
+			L.RaiseError("%s", msg)
 			return 0
 		}
 		L.Push(LFalse)
@@ -54,7 +54,7 @@ func coResume(L *LState) int {
 	if th.Dead {
 		msg := "can not resume a dead thread"
 		if th.wrapped {
-			L.RaiseError(msg)
+			L.RaiseError("%s", msg)
 			return 0
 		}
 		L.Push(LFalse)

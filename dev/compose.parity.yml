@@ -1,0 +1,39 @@
+# Disposable test stack only: no host ports, production credentials or retained dev volumes.
+services:
+  mysql:
+    profiles: [mysql]
+    image: ${PARITY_MYSQL_IMAGE:-mysql:8.4@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d}
+    command: ["--log-bin-trust-function-creators=ON"]
+    environment:
+      MYSQL_DATABASE: nakama
+      MYSQL_USER: nakama
+      MYSQL_PASSWORD: ${PARITY_DB_PASSWORD:?}
+      MYSQL_ROOT_PASSWORD: ${PARITY_ADMIN_PASSWORD:?}
+    volumes: [mysql_data:/var/lib/mysql]
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql --protocol=TCP -h 127.0.0.1 -u nakama -D nakama -e "SELECT 1" >/dev/null']
+      interval: 2s
+      timeout: 5s
+      start_period: 30s
+      retries: 60
+  test:
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile.parity
+    environment:
+      PARITY_DB_PASSWORD: ${PARITY_DB_PASSWORD:?}
+      PARITY_ADMIN_PASSWORD: ${PARITY_ADMIN_PASSWORD:?}
+      TEST_DB_BACKEND: ${PARITY_BACKEND:?}
+      TEST_DB_FAULTS: "true"
+      PARITY_RACE: ${PARITY_RACE:-true}
+      SKIPLIST_CHAOS_SEED: ${SKIPLIST_CHAOS_SEED:-1}
+      GOMAXPROCS: "2"
+      GOFLAGS: "-mod=vendor -p=2"
+    volumes:
+      - ${PARITY_REPORT_DIR:?}:/reports
+      - build_cache:/root/.cache/go-build
+volumes:
+  mysql_data:
+  build_cache:
+    external: true
+    name: nakama-mysql-build-cache

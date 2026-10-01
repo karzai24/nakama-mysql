@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL backend dispatch.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -123,7 +124,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 				ctx = context.WithValue(ctx, ctxTraceId{}, uuid.Must(uuid.NewV4()).String())
 				return handler(ctx, req)
 			},
-			consoleAuthInterceptor(logger, config, consoleSessionCache, loginAttemptCache),
+			consoleAuthInterceptor(logger, db, config, consoleSessionCache, loginAttemptCache),
 			consoleAuditLogInterceptor(logger, db),
 		),
 	}
@@ -255,7 +256,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 			method = methods[0]
 		}
 		return func(w http.ResponseWriter, r *http.Request) {
-			r, success, code, message := checkAuthCustom(r, logger, config, r.Header.Get("Authorization"), method, path, sessionCache, loginAttemptCache)
+			r, success, code, message := checkAuthCustom(r, logger, db, config, r.Header.Get("Authorization"), method, path, consoleSessionCache, loginAttemptCache)
 			if !success {
 				w.Header().Set("content-type", "application/json")
 				w.WriteHeader(code)
@@ -385,15 +386,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 			// Load all distinct collections from database.
 			collections := make([]string, 0, 10)
 
-			query := `
-WITH RECURSIVE t AS (
-   (SELECT collection FROM storage ORDER BY collection LIMIT 1)  -- Parentheses required, do not remove.
-   UNION ALL
-   SELECT (SELECT collection FROM storage WHERE collection > t.collection ORDER BY collection LIMIT 1)
-   FROM t
-   WHERE t.collection IS NOT NULL
-   )
-SELECT collection FROM t WHERE collection IS NOT NULL`
+			query := "SELECT DISTINCT collection FROM storage ORDER BY collection"
 			rows, err := s.db.QueryContext(ctx, query)
 			if err != nil {
 				s.logger.Error("Error querying storage collections.", zap.Error(err))
@@ -520,8 +513,8 @@ func (s *ConsoleServer) Stop() {
 	s.grpcServer.GracefulStop()
 }
 
-func consoleAuthInterceptor(logger *zap.Logger, config Config, sessionCache SessionCache, loginAttmeptCache LoginAttemptCache) func(context.Context, any, *grpc.UnaryServerInfo, grpc.UnaryHandler) (any, error) {
-	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+func consoleAuthInterceptor(logger *zap.Logger, db *sql.DB, config Config, sessionCache SessionCache, loginAttmeptCache LoginAttemptCache) func(context.Context, interface{}, *grpc.UnaryServerInfo, grpc.UnaryHandler) (interface{}, error) {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		if info.FullMethod == "/nakama.console.Console/Authenticate" {
 			// Skip authentication check for Login endpoint.
 			return handler(ctx, req)
@@ -552,7 +545,7 @@ func consoleAuthInterceptor(logger *zap.Logger, config Config, sessionCache Sess
 			return nil, status.Error(codes.Unauthenticated, "Console authentication required.")
 		}
 
-		ctx, err := checkAuth(ctx, logger, config, auth[0], info.FullMethod, sessionCache, loginAttmeptCache)
+		ctx, err := checkAuth(ctx, logger, db, config, auth[0], info.FullMethod, sessionCache, loginAttmeptCache)
 		if err != nil {
 			return nil, err
 		}
@@ -561,7 +554,7 @@ func consoleAuthInterceptor(logger *zap.Logger, config Config, sessionCache Sess
 	}
 }
 
-func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth, path string, sessionCache SessionCache, loginAttemptCache LoginAttemptCache) (context.Context, error) {
+func checkAuth(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config, auth, path string, sessionCache SessionCache, loginAttemptCache LoginAttemptCache) (context.Context, error) {
 	const basicPrefix = "Basic "
 	const bearerPrefix = "Bearer "
 
@@ -598,6 +591,7 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth, pat
 		ctx = context.WithValue(ctx, ctxConsoleUserAclKey{}, acl.Admin())
 		ctx = context.WithValue(ctx, ctxConsoleUsernameKey{}, username)
 		ctx = context.WithValue(ctx, ctxConsoleEmailKey{}, "")
+		ctx = context.WithValue(ctx, ctxConsoleUserIdKey{}, uuid.Nil)
 		// Basic authentication successful.
 		return ctx, nil
 	} else if strings.HasPrefix(auth, bearerPrefix) {
@@ -631,7 +625,7 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth, pat
 			// Malformed id
 			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
 		}
-		if !sessionCache.IsValidSession(userId, exp, tokenStr) {
+		if !sessionCache.IsValidSession(userId, exp, tokenStr) || !consoleRevision(ctx, db, userId, token) {
 			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
 		}
 
@@ -650,7 +644,7 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth, pat
 	return ctx, status.Error(codes.Unauthenticated, "Console authentication required.")
 }
 
-func checkAuthCustom(r *http.Request, logger *zap.Logger, config Config, auth, method, path string, sessionCache SessionCache, loginAttemptCache LoginAttemptCache) (*http.Request, bool, int, string) {
+func checkAuthCustom(r *http.Request, logger *zap.Logger, db *sql.DB, config Config, auth, method, path string, sessionCache SessionCache, loginAttemptCache LoginAttemptCache) (*http.Request, bool, int, string) {
 	const basicPrefix = "Basic "
 	const bearerPrefix = "Bearer "
 
@@ -687,6 +681,7 @@ func checkAuthCustom(r *http.Request, logger *zap.Logger, config Config, auth, m
 		ctx := context.WithValue(r.Context(), ctxConsoleUserAclKey{}, acl.Admin())
 		ctx = context.WithValue(ctx, ctxConsoleUsernameKey{}, username)
 		ctx = context.WithValue(ctx, ctxConsoleEmailKey{}, "")
+		ctx = context.WithValue(ctx, ctxConsoleUserIdKey{}, uuid.Nil)
 		// Basic authentication successful.
 		return r.WithContext(ctx), true, 0, ""
 	} else if strings.HasPrefix(auth, bearerPrefix) {
@@ -720,7 +715,7 @@ func checkAuthCustom(r *http.Request, logger *zap.Logger, config Config, auth, m
 			// Malformed id
 			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
 		}
-		if !sessionCache.IsValidSession(userId, exp, tokenStr) {
+		if !sessionCache.IsValidSession(userId, exp, tokenStr) || !consoleRevision(r.Context(), db, userId, token) {
 			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
 		}
 

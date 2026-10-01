@@ -189,12 +189,12 @@ func CheckACL(path string, userPermissions Permission) bool {
 		requiredPermissions = None()
 	case "/nakama.console.Console/ListAuditLogs":
 		requiredPermissions = NewPermission(console.AclResources_AUDIT_LOG, PermissionRead)
-	case "/nakama.console.Console/ListAuditLogUsers":
-		requiredPermissions = None()
+	case "/nakama.console.Console/ListAuditLogsUsers":
+		requiredPermissions = NewPermission(console.AclResources_AUDIT_LOG, PermissionRead)
 	case "/nakama.console.Console/AddAclTemplate":
 		requiredPermissions = NewPermission(console.AclResources_ACL_TEMPLATE, PermissionWrite)
 	case "/nakama.console.Console/AddUser":
-		requiredPermissions = NewPermission(console.AclResources_ACCOUNT, PermissionWrite)
+		requiredPermissions = NewPermission(console.AclResources_USER, PermissionWrite)
 	case "/nakama.console.Console/BanAccount":
 		requiredPermissions = NewPermission(console.AclResources_ACCOUNT, PermissionWrite)
 	case "/nakama.console.Console/AddAccountNote":
@@ -283,10 +283,8 @@ func CheckACL(path string, userPermissions Permission) bool {
 		requiredPermissions = NewPermission(console.AclResources_ACCOUNT_WALLET, PermissionRead)
 	case "/nakama.console.Console/ListAccounts":
 		requiredPermissions = NewPermission(console.AclResources_ACCOUNT, PermissionRead)
-	case "/nakama.console.Console/ListAccounts/ListAclTemplates":
-		requiredPermissions = None()
-	case "/nakama.console.Console/ListAccounts/ListAuditLogs":
-		requiredPermissions = NewPermission(console.AclResources_AUDIT_LOG, PermissionRead)
+	case "/nakama.console.Console/ListAclTemplates":
+		requiredPermissions = NewPermission(console.AclResources_ACL_TEMPLATE, PermissionRead)
 	case "/nakama.console.Console/ListApiEndpoints":
 		requiredPermissions = NewPermission(console.AclResources_API_EXPLORER, PermissionRead)
 	case "/nakama.console.Console/ListChannelMessages":
@@ -365,7 +363,7 @@ func CheckACL(path string, userPermissions Permission) bool {
 		requiredPermissions = NewPermission(console.AclResources_SATORI_MESSAGE, PermissionRead)
 	case "/nakama.console.Console/SatoriSendDirectMessage":
 		requiredPermissions = NewPermission(console.AclResources_SATORI_MESSAGE, PermissionWrite)
-	case "/nakama.console.Console/SendNotificationRequest":
+	case "/nakama.console.Console/SendNotification":
 		requiredPermissions = NewPermission(console.AclResources_NOTIFICATION, PermissionWrite)
 	case "/v2/console/storage/import":
 		// Special case for non-grpc gateway endpoint.

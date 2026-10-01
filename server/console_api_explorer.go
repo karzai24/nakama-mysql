@@ -122,7 +122,8 @@ func (s *ConsoleServer) extractApiCallContext(ctx context.Context, logger *zap.L
 			callCtx = context.WithValue(ctx, ctxFullMethodKey{}, "/nakama.api.Nakama/"+in.Method)
 		}
 	} else {
-		row := s.db.QueryRowContext(ctx, "SELECT username FROM users WHERE id = $1", in.UserId)
+		query := "SELECT username FROM users WHERE id = ?"
+		row := s.db.QueryRowContext(ctx, query, in.UserId)
 		var dbUsername string
 		userUUID, err := uuid.FromString(in.UserId)
 		if err != nil {

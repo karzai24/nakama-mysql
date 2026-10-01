@@ -29,92 +29,15 @@ import (
 )
 
 func (s *ConsoleServer) AddAclTemplate(ctx context.Context, in *console.AddAclTemplateRequest) (*console.AclTemplate, error) {
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	query := `
-		INSERT INTO console_acl_template
-			(id, name, description, acl)
-		VALUES
-			($1, $2, $3, $4)
-		RETURNING
-			name, description, acl, create_time, update_time
-`
 
-	templateAcl := acl.New(in.Acl)
-	aclValue, err := templateAcl.ToJson()
-	if err != nil {
-		logger.Error("Error marshaling acl to json", zap.Error(err))
-		return nil, status.Error(codes.Internal, "Internal error")
-	}
+	return s.writeAclTemplateMySQL(ctx, uuid.Must(uuid.NewV4()).String(), in.Name, in.Description, in.Acl, true)
 
-	id := uuid.Must(uuid.NewV4())
-	var createTime, updateTime time.Time
-	var name, description, aclJson string
-	if err = s.db.QueryRowContext(ctx, query, id, in.Name, in.Description, aclValue).Scan(&name, &description, &aclJson, &createTime, &updateTime); err != nil {
-		logger.Error("Error inserting acl template", zap.Error(err))
-		return nil, status.Error(codes.Internal, "Error adding ACL template.")
-	}
-
-	templateAcl, err = acl.NewFromJson(aclJson)
-	if err != nil {
-		logger.Error("Error unmarshaling acl from json", zap.Error(err))
-		return nil, status.Error(codes.Internal, "Internal error")
-	}
-
-	out := &console.AclTemplate{
-		Id:          id.String(),
-		Name:        name,
-		Description: description,
-		Acl:         templateAcl.ACL(),
-		CreateTime:  timestamppb.New(createTime),
-		UpdateTime:  timestamppb.New(updateTime),
-	}
-
-	return out, nil
 }
 
 func (s *ConsoleServer) UpdateAclTemplate(ctx context.Context, in *console.UpdateAclTemplateRequest) (*console.AclTemplate, error) {
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	query := `
-		UPDATE console_acl_template SET
-			name = $1,
-			description = $2,
-			acl = $3
-		WHERE
-			id = $4
-		RETURNING
-			id, name, description, acl, create_time, update_time
-`
 
-	templateAcl := acl.New(in.Acl)
-	aclValue, err := templateAcl.ToJson()
-	if err != nil {
-		logger.Error("Error marshaling acl to json", zap.Error(err))
-		return nil, status.Error(codes.Internal, "Internal error")
-	}
+	return s.writeAclTemplateMySQL(ctx, in.Id, in.Name, in.Description, in.Acl, false)
 
-	var id uuid.UUID
-	var createTime, updateTime time.Time
-	var name, description, aclJson string
-	if err = s.db.QueryRowContext(ctx, query, in.Name, in.Description, aclValue, in.Id).Scan(&id, &name, &description, &aclJson, &createTime, &updateTime); err != nil {
-		logger.Error("Error inserting acl template", zap.Error(err))
-		return nil, status.Error(codes.Internal, "Error adding ACL template.")
-	}
-
-	templateAcl, err = acl.NewFromJson(aclJson)
-	if err != nil {
-		logger.Error("Error unmarshaling acl from json", zap.Error(err))
-		return nil, status.Error(codes.Internal, "Internal error")
-	}
-
-	out := &console.AclTemplate{
-		Name:        name,
-		Description: description,
-		Acl:         templateAcl.ACL(),
-		CreateTime:  timestamppb.New(createTime),
-		UpdateTime:  timestamppb.New(updateTime),
-	}
-
-	return out, nil
 }
 
 func (s *ConsoleServer) ListAclTemplates(ctx context.Context, in *emptypb.Empty) (*console.AclTemplateList, error) {
@@ -163,12 +86,13 @@ func (s *ConsoleServer) ListAclTemplates(ctx context.Context, in *emptypb.Empty)
 		templates = append(templates, template)
 	}
 
-	return &console.AclTemplateList{Templates: templates}, nil
+	return &console.AclTemplateList{Templates: templates}, rows.Err()
 }
 
 func (s *ConsoleServer) DeleteAclTemplate(ctx context.Context, in *console.DeleteAclTemplateRequest) (*emptypb.Empty, error) {
 	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	if _, err := s.db.ExecContext(ctx, "DELETE from console_acl_template WHERE id = $1", in.Id); err != nil {
+	query := "DELETE FROM console_acl_template WHERE id = ?"
+	if _, err := s.db.ExecContext(ctx, query, in.Id); err != nil {
 		logger.Error("Error deleting acl template", zap.Error(err))
 		return nil, status.Error(codes.Internal, "Error deleting ACL template.")
 	}

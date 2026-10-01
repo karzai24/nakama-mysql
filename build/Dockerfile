@@ -39,10 +39,9 @@ FROM debian:bookworm-slim
 
 ARG VERSION
 
-LABEL maintainer="Heroic Labs"
-LABEL contact="support@heroiclabs.com"
+LABEL maintainer="nakama-mysql contributors"
 LABEL version=$VERSION
-LABEL variant=nakama
+LABEL variant=nakama-mysql
 LABEL description="Distributed server for social and realtime games and apps."
 
 ENV DEBIAN_FRONTEND=noninteractive

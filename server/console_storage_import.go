@@ -54,7 +54,7 @@ func (s *ConsoleServer) importStorage(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	ctx, err := checkAuth(r.Context(), logger, s.config, auth, r.URL.Path, s.consoleSessionCache, s.loginAttemptCache)
+	ctx, err := checkAuth(r.Context(), logger, s.db, s.config, auth, r.URL.Path, s.consoleSessionCache, s.loginAttemptCache)
 	if err != nil {
 		w.WriteHeader(401)
 		if _, err := w.Write([]byte(err.Error())); err != nil {

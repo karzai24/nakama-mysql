@@ -24,11 +24,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofrs/uuid/v5"
+	"github.com/go-sql-driver/mysql"
 	"github.com/heroiclabs/nakama/v3/console"
 	"github.com/heroiclabs/nakama/v3/console/acl"
-	"github.com/jackc/pgerrcode"
-	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -92,7 +90,8 @@ func TestResetUserPasswordAuthorizesTargetACLBeforeUpdate(t *testing.T) {
 			logger := zap.NewNop()
 			config := NewConfig(logger)
 			config.GetConsole().SigningKey = "synthetic-console-signing-key"
-			server := &ConsoleServer{logger: logger, db: db, config: config}
+			server := &ConsoleServer{logger: logger, db: db, config: config, consoleSessionCache: NewLocalSessionCache(60, 0)}
+			t.Cleanup(server.consoleSessionCache.Stop)
 			ctx := context.WithValue(context.Background(), ctxConsoleUserAclKey{}, callerRole)
 
 			response, err := server.ResetUserPassword(ctx, &console.Username{Username: "target"})
@@ -149,6 +148,10 @@ func (*resetPasswordACLTestConn) Prepare(string) (driver.Stmt, error) {
 
 func (*resetPasswordACLTestConn) Close() error { return nil }
 
+func (c *resetPasswordACLTestConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return resetPasswordACLTestTx{}, nil
+}
+
 func (c *resetPasswordACLTestConn) Begin() (driver.Tx, error) {
 	return resetPasswordACLTestTx{}, nil
 }
@@ -157,35 +160,28 @@ func (*resetPasswordACLTestConn) CheckNamedValue(*driver.NamedValue) error { ret
 
 func (c *resetPasswordACLTestConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	normalized := strings.Join(strings.Fields(query), " ")
-	switch {
-	case normalized == "SELECT acl FROM console_user WHERE username = $1 FOR UPDATE":
+	if !strings.HasPrefix(normalized, "SELECT "+consoleUserColumnsMySQL+" FROM console_user WHERE ") {
+		return nil, fmt.Errorf("unexpected query: %s", query)
+	}
+	if strings.Contains(normalized, "FOR UPDATE") {
 		c.state.selectCount++
-		if len(args) != 1 || args[0].Value != "target" {
-			return nil, fmt.Errorf("unexpected target ACL arguments: %v", args)
-		}
 		if c.state.selectFailures > 0 {
 			c.state.selectFailures--
-			return nil, &pgconn.PgError{Code: pgerrcode.SerializationFailure}
+			return nil, &mysql.MySQLError{Number: 1213, Message: "synthetic deadlock"}
 		}
 		if c.state.targetACLJSON == "missing" {
 			return nil, sql.ErrNoRows
 		}
-		return &resetPasswordACLTestRows{columns: []string{"acl"}, values: []driver.Value{[]byte(c.state.targetACLJSON)}}, nil
-	case strings.Contains(normalized, "UPDATE console_user SET password = $1, update_time = NOW() WHERE username = $2 RETURNING id, username, email, update_time"):
-		if len(args) != 2 || args[1].Value != "target" {
-			return nil, fmt.Errorf("unexpected password update arguments: %v", args)
-		}
-		if password, ok := args[0].Value.([]byte); !ok || len(password) == 0 {
-			return nil, fmt.Errorf("unexpected password hash: %T", args[0].Value)
-		}
-		c.state.updateCount++
-		return &resetPasswordACLTestRows{
-			columns: []string{"id", "username", "email", "update_time"},
-			values:  []driver.Value{uuid.Must(uuid.NewV4()).String(), "target", "target@example.invalid", time.Now().UTC()},
-		}, nil
-	default:
-		return nil, fmt.Errorf("unexpected query: %s (args=%v)", normalized, args)
 	}
+	return &resetPasswordACLTestRows{columns: []string{"id", "username", "email", "acl", "required", "enabled", "create", "update"}, values: []driver.Value{"11111111-1111-4111-8111-111111111111", "target", "test@example.invalid", []byte(c.state.targetACLJSON), false, false, time.Unix(1700000000, 0), time.Unix(1700000001, 0)}}, nil
+}
+
+func (c *resetPasswordACLTestConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if !strings.HasPrefix(query, "UPDATE console_user SET password = ?") {
+		return nil, fmt.Errorf("unexpected exec: %s", query)
+	}
+	c.state.updateCount++
+	return driver.RowsAffected(1), nil
 }
 
 type resetPasswordACLTestTx struct{}

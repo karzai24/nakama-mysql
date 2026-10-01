@@ -26,7 +26,7 @@ import (
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -35,6 +35,7 @@ import (
 )
 
 type notificationsCursor struct {
+	Filter         string
 	NotificationID []byte
 	UserID         []byte
 	CreateTime     int64
@@ -57,61 +58,65 @@ func (s *ConsoleServer) ListNotifications(ctx context.Context, in *console.ListN
 		}
 	}
 
-	query := `
-SELECT
-    id,
-    user_id,
-    subject,
-    content,
-    code,
-    sender_id,
-    create_time
-FROM
-    notification
-`
+	if in.Limit < 1 || in.Limit > 100 {
+		return nil, status.Error(codes.InvalidArgument, "Limit must be between 1 and 100.")
+	}
+	ownerFilter := ""
+	if in.UserId != "" {
+		owner, err := uuid.FromString(in.UserId)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid user ID.")
+		}
+		ownerFilter = owner.String()
+	}
+	if nc != nil {
+		if nc.Filter != ownerFilter {
+			return nil, status.Error(codes.InvalidArgument, "Cursor does not match user.")
+		}
+		if _, err := uuid.FromBytes(nc.UserID); err != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid cursor.")
+		}
+		if _, err := uuid.FromBytes(nc.NotificationID); err != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid cursor.")
+		}
+	}
+	query := ""
 
 	var params []any
 
 	if nc != nil {
 		if nc.IsNext {
 			if in.UserId == "" {
-				query += `
-WHERE (user_id, create_time, id) > ($1::UUID, $2::TIMESTAMPTZ, $3::UUID)
-ORDER BY user_id, create_time, id
-LIMIT $4`
+
 			} else {
-				query += `
-WHERE user_id = $1::UUID
-	AND (user_id, create_time, id) > ($1::UUID, $2::TIMESTAMPTZ, $3::UUID)
-ORDER BY user_id, create_time, id
-LIMIT $4`
+
 			}
 		} else {
 			if in.UserId == "" {
-				query += `
-WHERE (user_id, create_time, id) < ($1::UUID, $2::TIMESTAMPTZ, $3::UUID)
-ORDER BY user_id DESC, create_time DESC, id DESC
-LIMIT $4`
+
 			} else {
-				query += `
-WHERE user_id = $1::UUID
-	AND (user_id, create_time, id) < ($1::UUID, $2::TIMESTAMPTZ, $3::UUID)
-ORDER BY user_id DESC, create_time DESC, id DESC
-LIMIT $4`
+
 			}
 		}
-		params = append(params, nc.UserID, &pgtype.Timestamptz{Time: time.Unix(0, nc.CreateTime).UTC(), Valid: true}, uuid.FromBytesOrNil(nc.NotificationID))
+		params = append(params, nc.UserID, &sql.NullTime{Time: time.Unix(0, nc.CreateTime).UTC(), Valid: true}, uuid.FromBytesOrNil(nc.NotificationID))
 	} else {
 		if in.UserId == "" {
-			query += " ORDER BY user_id, create_time, id LIMIT $1"
+
 		} else {
-			query += " WHERE user_id = $1 ORDER BY user_id, create_time, id LIMIT $2"
+
 			params = append(params, in.UserId)
 		}
 	}
 
 	params = append(params, in.Limit+1)
 
+	{
+		var err error
+		query, params, err = consoleNotificationsQueryMySQL(in, nc)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows, err := s.db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Could not retrieve notifications.", zap.Error(err))
@@ -130,13 +135,14 @@ LIMIT $4`
 		content    string
 		code       int32
 		senderId   string
-		createTime pgtype.Timestamptz
+		createTime sql.NullTime
 	)
 
 	for rows.Next() {
 		if len(notifications) >= int(in.Limit) {
 			nextCursor = &notificationsCursor{
 				NotificationID: id.Bytes(),
+				Filter:         ownerFilter,
 				CreateTime:     createTime.Time.UnixNano(),
 				UserID:         userId.Bytes(),
 				IsNext:         true,
@@ -166,6 +172,7 @@ LIMIT $4`
 		if nc != nil && prevCursor == nil {
 			prevCursor = &notificationsCursor{
 				NotificationID: id.Bytes(),
+				Filter:         ownerFilter,
 				CreateTime:     createTime.Time.UnixNano(),
 				UserID:         userId.Bytes(),
 				IsNext:         false,
@@ -225,20 +232,8 @@ func (s *ConsoleServer) GetNotification(ctx context.Context, in *console.GetNoti
 		return nil, status.Error(codes.InvalidArgument, "notification id is required.")
 	}
 
-	query := `
-SELECT
-	id,
-	user_id,
-	subject,
-	content,
-	code,
-	sender_id,
-	create_time
-FROM
-	notification
-WHERE
-	id = $1
-`
+	query := ""
+
 	var (
 		id         uuid.UUID
 		userId     uuid.UUID
@@ -246,9 +241,17 @@ WHERE
 		content    string
 		code       int32
 		senderId   string
-		createTime pgtype.Timestamptz
+		createTime sql.NullTime
 	)
 
+	{
+		id, err := uuid.FromString(in.Id)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid notification ID.")
+		}
+		in.Id = id.String()
+		query = "SELECT id,user_id,subject,content,code,sender_id,create_time FROM notification WHERE id = ?"
+	}
 	if err := s.db.QueryRowContext(ctx, query, in.Id).Scan(&id, &userId, &subject, &content, &code, &senderId, &createTime); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, status.Error(codes.NotFound, "Notification not found.")
@@ -271,7 +274,8 @@ WHERE
 
 func (s *ConsoleServer) DeleteNotification(ctx context.Context, in *console.DeleteNotificationRequest) (*emptypb.Empty, error) {
 	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM notification WHERE id = $1", in.Id); err != nil {
+	query := "DELETE FROM notification WHERE id = ?"
+	if _, err := s.db.ExecContext(ctx, query, in.Id); err != nil {
 		logger.Error("Error deleting notification.", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to delete notification")
 	}

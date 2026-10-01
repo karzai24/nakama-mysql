@@ -2,16 +2,13 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"net/url"
 	"sort"
-	"time"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/console"
-	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -46,48 +43,7 @@ func (s *ConsoleServer) ListChannelMessages(ctx context.Context, in *console.Lis
 }
 
 func (s *ConsoleServer) DeleteChannelMessages(ctx context.Context, in *console.DeleteChannelMessagesRequest) (*console.DeleteChannelMessagesResponse, error) {
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	var affected int64
-	if in.Before != nil {
-		query := "DELETE FROM message WHERE create_time < $1::TIMESTAMPTZ"
-		deleteBefore := time.Unix(in.Before.Seconds, int64(in.Before.Nanos)).UTC()
-
-		var res sql.Result
-		var err error
-		if res, err = s.db.ExecContext(ctx, query, deleteBefore); err != nil {
-			logger.Error("Could not delete messages.", zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to delete messages.")
-		}
-		affected, err = res.RowsAffected()
-		if err != nil {
-			logger.Error("Could not count deleted messages.", zap.Error(err))
-		}
-		logger.Info("Messages deleted.", zap.Int64("affected", affected), zap.String("timestamp", deleteBefore.String()))
-	}
-	if len(in.Ids) > 0 {
-		for _, id := range in.Ids {
-			_, err := uuid.FromString(id)
-			if err != nil {
-				return nil, status.Error(codes.InvalidArgument, "Requires a valid message ID.")
-			}
-		}
-		query := "DELETE FROM message WHERE id = ANY($1)"
-		var res sql.Result
-		var err error
-		if res, err = s.db.ExecContext(ctx, query, in.Ids); err != nil {
-			logger.Error("Could not delete messages.", zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to delete messages.")
-		}
-		batch, err := res.RowsAffected()
-		if err != nil {
-			logger.Error("Could not count deleted messages.", zap.Error(err))
-		}
-		affected = affected + batch
-
-		logger.Info("Messages batch deleted.", zap.Int64("size", batch))
-	}
-
-	return &console.DeleteChannelMessagesResponse{Total: affected}, nil
+	return deleteChannelMessages(ctx, s.db, in)
 }
 
 func buildStream(in *console.ListChannelMessagesRequest) (*PresenceStream, error) {
