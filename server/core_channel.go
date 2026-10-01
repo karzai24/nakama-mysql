@@ -30,7 +30,7 @@ import (
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -72,6 +72,10 @@ func ChannelMessagesList(ctx context.Context, logger *zap.Logger, db *sql.DB, ca
 		}
 		incomingCursor = &channelMessageListCursor{}
 		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
+			return nil, runtime.ErrChannelCursorInvalid
+		}
+
+		if _, err := uuid.FromString(incomingCursor.Id); err != nil {
 			return nil, runtime.ErrChannelCursorInvalid
 		}
 
@@ -117,29 +121,36 @@ func ChannelMessagesList(ctx context.Context, logger *zap.Logger, db *sql.DB, ca
 		}
 	}
 
-	query := `SELECT id, code, sender_id, username, content, create_time, update_time FROM message
-WHERE stream_mode = $1 AND stream_subject = $2::UUID AND stream_descriptor = $3::UUID AND stream_label = $4`
+	query := ""
+
 	if incomingCursor == nil {
 		if forward {
-			query += " ORDER BY create_time ASC, id ASC"
+
 		} else {
-			query += " ORDER BY create_time DESC, id DESC"
+
 		}
 	} else {
 		if (forward && incomingCursor.IsNext) || (!forward && !incomingCursor.IsNext) {
 			// Forward and next page == backwards and previous page.
-			query += " AND (stream_mode, stream_subject, stream_descriptor, stream_label, create_time, id) > ($1, $2::UUID, $3::UUID, $4, $6, $7) ORDER BY create_time ASC, id ASC"
+
 		} else {
 			// Forward and previous page == backwards and next page.
-			query += " AND (stream_mode, stream_subject, stream_descriptor, stream_label, create_time, id) < ($1, $2::UUID, $3::UUID, $4, $6, $7) ORDER BY create_time DESC, id DESC"
+
 		}
 	}
-	query += " LIMIT $5"
+
 	params := []interface{}{stream.Mode, stream.Subject, stream.Subcontext, stream.Label, limit + 1}
 	if incomingCursor != nil {
 		params = append(params, time.Unix(0, incomingCursor.CreateTime).UTC(), incomingCursor.Id)
 	}
 
+	{
+		var err error
+		query, params, err = channelMessagesQueryMySQL(stream, limit, forward, incomingCursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Error listing channel messages", zap.Error(err))
@@ -157,8 +168,8 @@ WHERE stream_mode = $1 AND stream_subject = $2::UUID AND stream_descriptor = $3:
 	var dbSenderID string
 	var dbUsername string
 	var dbContent string
-	var dbCreateTime pgtype.Timestamptz
-	var dbUpdateTime pgtype.Timestamptz
+	var dbCreateTime sql.NullTime
+	var dbUpdateTime sql.NullTime
 	for rows.Next() {
 		if len(messages) >= limit {
 			nextCursor = &channelMessageListCursor{
@@ -219,6 +230,9 @@ WHERE stream_mode = $1 AND stream_subject = $2::UUID AND stream_descriptor = $3:
 		}
 	}
 	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	if incomingCursor != nil && !incomingCursor.IsNext {
 		// If this was a previous page listing, flip the results to their normal order and swap the cursors.
@@ -295,166 +309,25 @@ WHERE stream_mode = $1 AND stream_subject = $2::UUID AND stream_descriptor = $3:
 }
 
 func ChannelMessageSend(ctx context.Context, logger *zap.Logger, db *sql.DB, router MessageRouter, channelStream PresenceStream, channelId, content, senderId, senderUsername string, persist bool) (*rtapi.ChannelMessageAck, error) {
-	ts := timestamppb.New(time.Now().UTC())
-	message := &api.ChannelMessage{
-		ChannelId:  channelId,
-		MessageId:  uuid.Must(uuid.NewV4()).String(),
-		Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeChat},
-		SenderId:   senderId,
-		Username:   senderUsername,
-		Content:    content,
-		CreateTime: ts,
-		UpdateTime: ts,
-		Persistent: &wrapperspb.BoolValue{Value: persist},
-	}
 
-	ack := &rtapi.ChannelMessageAck{
-		ChannelId:  message.ChannelId,
-		MessageId:  message.MessageId,
-		Code:       message.Code,
-		Username:   message.Username,
-		CreateTime: message.CreateTime,
-		UpdateTime: message.UpdateTime,
-		Persistent: message.Persistent,
-	}
-	switch channelStream.Mode {
-	case StreamModeChannel:
-		message.RoomName, ack.RoomName = channelStream.Label, channelStream.Label
-	case StreamModeGroup:
-		message.GroupId, ack.GroupId = channelStream.Subject.String(), channelStream.Subject.String()
-	case StreamModeDM:
-		message.UserIdOne, ack.UserIdOne = channelStream.Subject.String(), channelStream.Subject.String()
-		message.UserIdTwo, ack.UserIdTwo = channelStream.Subcontext.String(), channelStream.Subcontext.String()
-	}
+	return channelMessageMySQL(ctx, logger, db, router, channelStream, channelId, uuid.Must(uuid.NewV4()).String(), content, senderId, senderUsername, persist, ChannelMessageTypeChat)
 
-	if persist {
-		query := `INSERT INTO message (id, code, sender_id, username, stream_mode, stream_subject, stream_descriptor, stream_label, content, create_time, update_time)
-VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
-		_, err := db.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, channelStream.Mode, channelStream.Subject, channelStream.Subcontext, channelStream.Label, message.Content, message.CreateTime.AsTime())
-		if err != nil {
-			logger.Error("Error persisting channel message", zap.Error(err))
-			return nil, errChannelMessagePersist
-		}
-	}
-
-	router.SendToStream(logger, channelStream, &rtapi.Envelope{Message: &rtapi.Envelope_ChannelMessage{ChannelMessage: message}}, true)
-
-	return ack, nil
 }
 
 func ChannelMessageUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, router MessageRouter, channelStream PresenceStream, channelId, messageId, content, senderId, senderUsername string, persist bool) (*rtapi.ChannelMessageAck, error) {
-	ts := time.Now().UTC()
-	message := &api.ChannelMessage{
-		ChannelId:  channelId,
-		MessageId:  messageId,
-		Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeChatUpdate},
-		SenderId:   senderId,
-		Username:   senderUsername,
-		Content:    content,
-		CreateTime: timestamppb.New(ts),
-		UpdateTime: timestamppb.New(ts),
-		Persistent: &wrapperspb.BoolValue{Value: persist},
-	}
 
-	ack := &rtapi.ChannelMessageAck{
-		ChannelId:  message.ChannelId,
-		MessageId:  message.MessageId,
-		Code:       message.Code,
-		Username:   message.Username,
-		CreateTime: message.CreateTime,
-		UpdateTime: message.UpdateTime,
-		Persistent: message.Persistent,
-	}
+	return channelMessageMySQL(ctx, logger, db, router, channelStream, channelId, messageId, content, senderId, senderUsername, persist, ChannelMessageTypeChatUpdate)
 
-	switch channelStream.Mode {
-	case StreamModeChannel:
-		message.RoomName, ack.RoomName = channelStream.Label, channelStream.Label
-	case StreamModeGroup:
-		message.GroupId, ack.GroupId = channelStream.Subject.String(), channelStream.Subject.String()
-	case StreamModeDM:
-		message.UserIdOne, ack.UserIdOne = channelStream.Subject.String(), channelStream.Subject.String()
-		message.UserIdTwo, ack.UserIdTwo = channelStream.Subcontext.String(), channelStream.Subcontext.String()
-	}
-
-	if persist {
-		// First find and update the referenced message.
-		var dbCreateTime pgtype.Timestamptz
-		query := "UPDATE message SET update_time = $5, username = $4, content = $3 WHERE id = $1 AND sender_id = $2 RETURNING create_time"
-		err := db.QueryRowContext(ctx, query, messageId, message.SenderId, message.Content, message.Username, message.UpdateTime.AsTime()).Scan(&dbCreateTime)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return nil, errChannelMessageNotFound
-			}
-			logger.Error("Error persisting channel message update", zap.Error(err))
-			return nil, errChannelMessagePersist
-		}
-		// Replace the message create time with the real one from DB.
-		*message.CreateTime = *timestamppb.New(dbCreateTime.Time)
-	}
-
-	router.SendToStream(logger, channelStream, &rtapi.Envelope{Message: &rtapi.Envelope_ChannelMessage{ChannelMessage: message}}, true)
-
-	return ack, nil
 }
 
 func ChannelMessageRemove(ctx context.Context, logger *zap.Logger, db *sql.DB, router MessageRouter, channelStream PresenceStream, channelId, messageId, senderId, senderUsername string, persist bool) (*rtapi.ChannelMessageAck, error) {
-	ts := time.Now().UTC()
-	message := &api.ChannelMessage{
-		ChannelId:  channelId,
-		MessageId:  messageId,
-		Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeChatRemove},
-		SenderId:   senderId,
-		Username:   senderUsername,
-		Content:    "{}",
-		CreateTime: timestamppb.New(ts),
-		UpdateTime: timestamppb.New(ts),
-		Persistent: &wrapperspb.BoolValue{Value: persist},
-	}
 
-	ack := &rtapi.ChannelMessageAck{
-		ChannelId:  message.ChannelId,
-		MessageId:  message.MessageId,
-		Code:       message.Code,
-		Username:   message.Username,
-		CreateTime: message.CreateTime,
-		UpdateTime: message.UpdateTime,
-		Persistent: message.Persistent,
-	}
+	return channelMessageMySQL(ctx, logger, db, router, channelStream, channelId, messageId, "{}", senderId, senderUsername, persist, ChannelMessageTypeChatRemove)
 
-	switch channelStream.Mode {
-	case StreamModeChannel:
-		message.RoomName, ack.RoomName = channelStream.Label, channelStream.Label
-	case StreamModeGroup:
-		message.GroupId, ack.GroupId = channelStream.Subject.String(), channelStream.Subject.String()
-	case StreamModeDM:
-		message.UserIdOne, ack.UserIdOne = channelStream.Subject.String(), channelStream.Subject.String()
-		message.UserIdTwo, ack.UserIdTwo = channelStream.Subcontext.String(), channelStream.Subcontext.String()
-	}
-
-	if persist {
-		// First find and remove the referenced message.
-		var dbCreateTime, dbUpdateTime pgtype.Timestamptz
-		query := "DELETE FROM message WHERE id = $1 AND sender_id = $2 RETURNING create_time, update_time"
-		err := db.QueryRowContext(ctx, query, messageId, message.SenderId).Scan(&dbCreateTime, &dbUpdateTime)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return nil, errChannelMessageNotFound
-			}
-			logger.Error("Error persisting channel message remove", zap.Error(err))
-			return nil, errChannelMessagePersist
-		}
-		// Replace the message create time with the real one from DB.
-		*message.CreateTime = *timestamppb.New(dbCreateTime.Time)
-		*message.UpdateTime = *timestamppb.New(dbUpdateTime.Time)
-	}
-
-	router.SendToStream(logger, channelStream, &rtapi.Envelope{Message: &rtapi.Envelope_ChannelMessage{ChannelMessage: message}}, true)
-
-	return ack, nil
 }
 
 func GetChannelMessages(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID) ([]*api.ChannelMessage, error) {
-	query := "SELECT id, code, username, stream_mode, stream_subject, stream_descriptor, stream_label, content, create_time, update_time FROM message WHERE sender_id = $1::UUID"
+	query := "SELECT id,code,username,stream_mode,stream_subject,stream_descriptor,stream_label,content,create_time,update_time FROM message WHERE sender_id = ?"
 	rows, err := db.QueryContext(ctx, query, userID)
 	if err != nil {
 		logger.Error("Error listing channel messages for user", zap.String("user_id", userID.String()), zap.Error(err))
@@ -471,8 +344,8 @@ func GetChannelMessages(ctx context.Context, logger *zap.Logger, db *sql.DB, use
 	var dbStreamSubcontext string
 	var dbStreamLabel string
 	var dbContent string
-	var dbCreateTime pgtype.Timestamptz
-	var dbUpdateTime pgtype.Timestamptz
+	var dbCreateTime sql.NullTime
+	var dbUpdateTime sql.NullTime
 	for rows.Next() {
 		err = rows.Scan(&dbID, &dbCode, &dbUsername, &dbStreamMode, &dbStreamSubject, &dbStreamSubcontext, &dbStreamLabel, &dbContent, &dbCreateTime, &dbUpdateTime)
 		if err != nil {
@@ -504,6 +377,9 @@ func GetChannelMessages(ctx context.Context, logger *zap.Logger, db *sql.DB, use
 		})
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return messages, nil
 }
 
@@ -677,4 +553,21 @@ func BuildChannelId(ctx context.Context, logger *zap.Logger, db *sql.DB, userID 
 	}
 
 	return channelID, stream, nil
+}
+
+// Canonical IDs keep live events, acknowledgements and persisted history consistent.
+// An empty runtime sender denotes the built-in system account on either database.
+func canonicalChannelMessageIdentifiers(messageID, senderID string) (string, string, error) {
+	if senderID == "" {
+		senderID = uuid.Nil.String()
+	}
+	sender, err := uuid.FromString(senderID)
+	if err != nil {
+		return "", "", errChannelMessagePersist
+	}
+	id, err := uuid.FromString(messageID)
+	if err != nil {
+		return "", "", errChannelMessageNotFound
+	}
+	return id.String(), sender.String(), nil
 }

@@ -1249,8 +1249,7 @@ func TestMatchmakerAddMultipleAndSomeMatch(t *testing.T) {
 	if _, ok := matchesSeen[sessionID.String()]; !ok {
 		t.Errorf("expected session1 to match, it didn't %#v", matchesSeen)
 	}
-	// cannot assert session2 or session3, one of them will match, but it
-	// cannot be assured which one
+
 }
 
 // should add multiple to matchmaker and some match
@@ -1469,8 +1468,7 @@ func TestMatchmakerAddMultipleAndSomeMatchOptionalTextAlteringScore(t *testing.T
 	if _, ok := matchesSeen[sessionID.String()]; !ok {
 		t.Errorf("expected session1 to match, it didn't %#v", matchesSeen)
 	}
-	// cannot assert session2 or session3, one of them will match, but it
-	// cannot be assured which one
+
 }
 
 // should add to matchmaker and match authoritative
@@ -1623,7 +1621,7 @@ func TestGroupIndexes(t *testing.T) {
 // to ensure proper resource management
 func createTestMatchmaker(t fatalable, logger *zap.Logger, tickerActive bool, messageCallback func(presences []*PresenceID, envelope *rtapi.Envelope)) (*LocalMatchmaker, func() error, error) {
 	cfg := NewConfig(logger)
-	cfg.Database.Addresses = []string{"postgres:postgres@localhost:5432/nakama"}
+	cfg.Database.Addresses = []string{"nakama:test@localhost:3306/nakama?tls=false"}
 	cfg.Matchmaker.IntervalSec = 1
 	cfg.Matchmaker.MaxIntervals = 5
 	cfg.Matchmaker.RevPrecision = true
@@ -2025,8 +2023,6 @@ func isModeAuthoritative(props map[string]interface{}) bool {
 	}
 	return false
 }
-
-// *** Benchmarks
 
 // BenchmarkMatchmakerSmallProcessAllMutual attempts to
 // benchmark the Matchmaker as follows:
@@ -2453,14 +2449,6 @@ func BenchmarkMatchmakerProcessTickets1_000_min2_max2(b *testing.B) {
 	benchmarkMatchmakerProcessTickets(1_000, 100, 2, 2, b)
 }
 
-//func BenchmarkMatchmakerProcessTickets10_000_min2_max2(b *testing.B) {
-//	benchmarkMatchmakerProcessTickets(10_000, 5000, 2, 2, b)
-//}
-
-/*func BenchmarkMatchmakerProcessTickets100_000_min2_max2(b *testing.B) {
-	benchmarkMatchmakerProcessTickets(100_000, 2, 2, b)
-}*/
-
 func BenchmarkMatchmakerProcessTickets100_min4_max10(b *testing.B) {
 	benchmarkMatchmakerProcessTickets(100, 10, 4, 10, b)
 }
@@ -2472,11 +2460,3 @@ func BenchmarkMatchmakerProcessTickets500_min4_max10(b *testing.B) {
 func BenchmarkMatchmakerProcessTickets1_000_min4_max10(b *testing.B) {
 	benchmarkMatchmakerProcessTickets(1_000, 100, 4, 10, b)
 }
-
-//func BenchmarkMatchmakerProcessTickets10_000_min4_max4(b *testing.B) {
-//	benchmarkMatchmakerProcessTickets(10_000, 4, 4, b)
-//}
-
-/*func BenchmarkMatchmakerProcessTickets100_000(b *testing.B) {
-	benchmarkMatchmakerProcessTickets(100_000, 4, 4, b)
-}*/

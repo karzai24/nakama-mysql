@@ -88,12 +88,13 @@ func runtimeWithModulesWithData(t *testing.T, modules map[string]string) (*Runti
 	cfg := NewConfig(logger)
 	cfg.Runtime.Path = dir
 
-	ctx := context.Background()
+	ctx := t.Context()
 	db := NewDB(t)
 	lbCache := NewLocalLeaderboardCache(ctx, logger, logger, db)
 	lbRankCache := NewLocalLeaderboardRankCache(
 		ctx, logger, db, cfg.Leaderboard, lbCache)
 	lbSched := NewLocalLeaderboardScheduler(logger, db, cfg, lbCache, lbRankCache)
+	t.Cleanup(lbSched.Stop)
 
 	data := &testRuntimeData{
 		leaderboardCache:     lbCache,
@@ -103,8 +104,11 @@ func runtimeWithModulesWithData(t *testing.T, modules map[string]string) (*Runti
 	sessionRegistry := NewLocalSessionRegistry(metrics)
 	tracker := &LocalTracker{sessionRegistry: sessionRegistry}
 	statusRegistry := NewLocalStatusRegistry(logger, cfg, sessionRegistry, protojsonMarshaler)
+	t.Cleanup(statusRegistry.Stop)
+	sessionCache := NewLocalSessionCache(cfg.Session.TokenExpirySec, cfg.Session.RefreshTokenExpirySec)
+	t.Cleanup(sessionCache.Stop)
 
-	rt, rtInfo, err := NewRuntime(ctx, logger, logger, db, protojsonMarshaler, protojsonUnmarshaler, cfg, "", nil, lbCache, lbRankCache, lbSched, sessionRegistry, nil, statusRegistry, nil, nil, tracker, metrics, nil, &DummyMessageRouter{}, storageIdx, nil)
+	rt, rtInfo, err := NewRuntime(ctx, logger, logger, db, protojsonMarshaler, protojsonUnmarshaler, cfg, "", nil, lbCache, lbRankCache, lbSched, sessionRegistry, sessionCache, statusRegistry, nil, nil, tracker, metrics, nil, &DummyMessageRouter{}, storageIdx, nil)
 
 	return rt, rtInfo, data, err
 }
@@ -1021,7 +1025,7 @@ func TestRuntimeGroupTests(t *testing.T) {
 		"test": `
 local nk = require("nakama")
 
-local user_id = nk.uuid_v4()
+local user_id = nk.authenticate_custom(nk.uuid_v4())
 local group_name = nk.uuid_v4()
 local group_update_name = nk.uuid_v4()
 
@@ -1032,13 +1036,15 @@ assert((group.name == group_name), "'group.name' must be set")
 nk.group_update(group.id, user_id, group_update_name)
 
 local users = nk.group_users_list(group.id)
+assert(#users == 1, "group must contain its real creator")
 for i, u in ipairs(users)
 do
-  assert(u.user.id == user_id, "'u.id' must be equal to user_id")
+  assert(u.user.user_id == user_id, "user_id must match the group creator")
 	assert(u.state == 0, "'u.state' must be equal to 0 / superadmin")
 end
 
 local groups = nk.user_groups_list(user_id)
+assert(#groups == 1, "creator must belong to the group")
 for i, g in ipairs(groups)
 do
 	print(nk.json_encode(g))
@@ -1046,7 +1052,8 @@ do
 	assert(g.state == 0, "'g.state' must be equal to 0 / superadmin")
 end
 
-nk.group_delete(group.id)`,
+nk.group_delete(group.id)
+nk.account_delete_id(user_id)`,
 	}
 
 	_, _, err := runtimeWithModules(t, modules)

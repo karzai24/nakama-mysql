@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL account lifecycle integration.
 // Copyright 2020 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -714,7 +715,7 @@ func (n *RuntimeJavascriptNakamaModule) sqlExec(r *goja.Runtime) func(goja.Funct
 			return err
 		})
 		if err != nil {
-			n.logger.Error("Failed to exec db query.", zap.String("query", query), zap.Any("args", args), zap.Error(err))
+			n.logger.Error("Failed to exec db query.", zap.Error(err))
 			panic(r.NewGoError(fmt.Errorf("failed to exec db query: %s", err.Error())))
 		}
 
@@ -755,7 +756,7 @@ func (n *RuntimeJavascriptNakamaModule) sqlQuery(r *goja.Runtime) func(goja.Func
 			return err
 		})
 		if err != nil {
-			n.logger.Error("Failed to exec db query.", zap.String("query", query), zap.Any("args", args), zap.Error(err))
+			n.logger.Error("Failed to exec db query.", zap.Error(err))
 			panic(r.NewGoError(fmt.Errorf("failed to exec db query: %s", err.Error())))
 		}
 		defer rows.Close()
@@ -764,6 +765,13 @@ func (n *RuntimeJavascriptNakamaModule) sqlQuery(r *goja.Runtime) func(goja.Func
 		if err != nil {
 			n.logger.Error("Failed to get row columns.", zap.Error(err))
 			panic(r.NewGoError(fmt.Errorf("failed to get row columns: %s", err.Error())))
+		}
+		var columnTypes []*sql.ColumnType
+		{
+			columnTypes, err = rows.ColumnTypes()
+			if err != nil {
+				panic(r.NewGoError(err))
+			}
 		}
 		rowsColumnCount := len(rowColumns)
 		resultRows := make([]*[]interface{}, 0)
@@ -788,7 +796,11 @@ func (n *RuntimeJavascriptNakamaModule) sqlQuery(r *goja.Runtime) func(goja.Func
 		for _, row := range resultRows {
 			resultRow := make(map[string]interface{}, rowsColumnCount)
 			for i, col := range rowColumns {
-				resultRow[col] = (*row)[i]
+				value := (*row)[i]
+				if columnTypes != nil {
+					value = runtimeSQLMySQLValue(columnTypes[i].DatabaseTypeName(), value)
+				}
+				resultRow[col] = value
 			}
 			results = append(results, resultRow)
 		}
@@ -2165,7 +2177,7 @@ func (n *RuntimeJavascriptNakamaModule) accountDeleteId(r *goja.Runtime) func(go
 			recorded = getJsBool(r, f.Argument(1))
 		}
 
-		if err := DeleteAccount(n.ctx, n.logger, n.db, n.config, n.leaderboardCache, n.rankCache, n.sessionRegistry, n.sessionCache, n.tracker, userID, recorded); err != nil {
+		if err := DeleteAccount(n.ctx, n.logger, n.db, n.config, n.leaderboardCache, n.rankCache, n.sessionRegistry, n.sessionCache, n.tracker, userID, recorded, n.storageIndex); err != nil {
 			panic(r.NewGoError(fmt.Errorf("error while trying to delete account: %v", err.Error())))
 		}
 
@@ -2233,7 +2245,7 @@ func (n *RuntimeJavascriptNakamaModule) accountImportId(r *goja.Runtime) func(go
 			}
 		}
 
-		account, err := ImportAccount(n.ctx, n.logger, n.db, n.statusRegistry, uid, d)
+		account, err := ImportAccount(n.ctx, n.logger, n.db, n.statusRegistry, uid, d, n.storageIndex)
 		if err != nil {
 			panic(r.NewGoError(fmt.Errorf("error importing account: %v", err.Error())))
 		}
@@ -4619,11 +4631,11 @@ func (n *RuntimeJavascriptNakamaModule) walletLedgerUpdate(r *goja.Runtime) func
 		}
 
 		return r.ToValue(map[string]interface{}{
-			"id":         itemID,
+			"id":         item.ID,
 			"userId":     item.UserID,
 			"createTime": item.CreateTime,
 			"updateTime": item.UpdateTime,
-			"changeset":  metadata,
+			"changeset":  item.Changeset,
 			"metadata":   item.Metadata,
 		})
 	}
@@ -4730,6 +4742,10 @@ func (n *RuntimeJavascriptNakamaModule) walletLedgerList(r *goja.Runtime) func(g
 		limit := 100
 		if f.Argument(1) != goja.Undefined() {
 			limit = int(getJsInt(r, f.Argument(1)))
+		}
+
+		if limit < 0 || limit > 100 {
+			panic(r.NewTypeError("expects limit to be 0-100"))
 		}
 
 		cursor := ""

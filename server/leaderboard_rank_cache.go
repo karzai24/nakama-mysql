@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL backend dispatch.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -511,15 +512,18 @@ func leaderboardCacheInitWorker(
 		for {
 			ranks := make(map[uuid.UUID]skiplist.Interface, batchSize)
 
-			query := "SELECT owner_id, score, subscore, num_score FROM leaderboard_record WHERE leaderboard_id = $1 AND expiry_time = $2"
+			var query string
 			params := []interface{}{leaderboard.Id, expiryTime}
 			if ownerIDStr != "" {
-				query += " AND (leaderboard_id, expiry_time, score, subscore, owner_id) > ($1, $2, $3, $4, $5)"
 				params = append(params, score, subscore, ownerIDStr)
 			}
-			// Does not need to be in leaderboard order, sorting is done in the rank cache structure anyway.
-			query += " ORDER BY leaderboard_id ASC, expiry_time ASC, score ASC, subscore ASC, owner_id ASC LIMIT " + batchSizeStr
-
+			{
+				query = "SELECT owner_id, score, subscore, num_score FROM leaderboard_record WHERE leaderboard_id = ? AND expiry_time = ?"
+				if ownerIDStr != "" {
+					query += " AND (score, subscore, owner_id) > (?, ?, ?)"
+				}
+				query += " ORDER BY score ASC, subscore ASC, owner_id ASC LIMIT " + batchSizeStr
+			}
 			rows, err := db.QueryContext(ctx, query, params...)
 
 			if err != nil {

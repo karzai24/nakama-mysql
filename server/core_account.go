@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL backend dispatch.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,18 +20,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"strconv"
-	"strings"
+
 	"time"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -70,22 +66,25 @@ func GetAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegis
 	var steam sql.NullString
 	var customID sql.NullString
 	var edgeCount int
-	var createTime pgtype.Timestamptz
-	var updateTime pgtype.Timestamptz
-	var verifyTime pgtype.Timestamptz
-	var disableTime pgtype.Timestamptz
-	var deviceIDs pgtype.FlatArray[string]
+	var createTime sql.NullTime
+	var updateTime sql.NullTime
+	var verifyTime sql.NullTime
+	var disableTime sql.NullTime
+	var deviceIDs []string
 
-	m := pgtype.NewMap()
+	query := ""
 
-	query := `
-SELECT u.username, u.display_name, u.avatar_url, u.lang_tag, u.location, u.timezone, u.metadata, u.wallet,
-	u.email, u.apple_id, u.facebook_id, u.facebook_instant_game_id, u.google_id, u.gamecenter_id, u.steam_id, u.custom_id, u.edge_count,
-	u.create_time, u.update_time, u.verify_time, u.disable_time, array(select ud.id from user_device ud where u.id = ud.user_id)
-FROM users u
-WHERE u.id = $1`
-
-	if err := db.QueryRowContext(ctx, query, userID).Scan(&username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, m.SQLScanner(&deviceIDs)); err != nil {
+	var mysqlDevices string
+	var deviceScanner any = &mysqlDevices
+	{
+		query = `SELECT u.username, u.display_name, u.avatar_url, u.lang_tag, u.location, u.timezone, u.metadata, u.wallet,
+            u.email, u.apple_id, u.facebook_id, u.facebook_instant_game_id, u.google_id, u.gamecenter_id, u.steam_id, u.custom_id, u.edge_count,
+            u.create_time, u.update_time, u.verify_time, u.disable_time,
+            COALESCE((SELECT JSON_ARRAYAGG(ud.id) FROM user_device ud WHERE u.id = ud.user_id), JSON_ARRAY())
+            FROM users u WHERE u.id = ?`
+		deviceScanner = &mysqlDevices
+	}
+	if err := db.QueryRowContext(ctx, query, userID).Scan(&username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, deviceScanner); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrAccountNotFound
 		}
@@ -93,6 +92,11 @@ WHERE u.id = $1`
 		return nil, err
 	}
 
+	{
+		if err := json.Unmarshal([]byte(mysqlDevices), &deviceIDs); err != nil {
+			return nil, err
+		}
+	}
 	devices := make([]*api.AccountDevice, 0, len(deviceIDs))
 	for _, deviceID := range deviceIDs {
 		devices = append(devices, &api.AccountDevice{Id: deviceID})
@@ -147,23 +151,11 @@ func GetAccounts(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegi
 		return []*api.Account{}, nil
 	}
 
-	query := `
-SELECT u.id, u.username, u.display_name, u.avatar_url, u.lang_tag, u.location, u.timezone, u.metadata, u.wallet,
-	u.email, u.apple_id, u.facebook_id, u.facebook_instant_game_id, u.google_id, u.gamecenter_id, u.steam_id, u.custom_id, u.edge_count,
-	u.create_time, u.update_time, u.verify_time, u.disable_time, array(select ud.id from user_device ud where u.id = ud.user_id)
-FROM users u`
-	params := make([]interface{}, 0, 2)
-	switch {
-	case len(userIDs) > 0 && len(deviceIDs) > 0:
-		query += " WHERE u.id = ANY($1) OR u.id IN (SELECT ud.user_id FROM user_device ud WHERE ud.id = ANY($2))"
-		params = append(params, userIDs, deviceIDs)
-	case len(userIDs) > 0:
-		query += " WHERE u.id = ANY($1)"
-		params = append(params, userIDs)
-	case len(deviceIDs) > 0:
-		query += " WHERE u.id IN (SELECT ud.user_id FROM user_device ud WHERE ud.id = ANY($1))"
-		params = append(params, deviceIDs)
+	canonical, err := canonicalUserIDsMySQL(userIDs)
+	if err != nil {
+		return nil, err
 	}
+	query, params := accountLookupMySQL(canonical, deviceIDs)
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Error retrieving user accounts.", zap.Error(err))
@@ -190,19 +182,29 @@ FROM users u`
 		var steam sql.NullString
 		var customID sql.NullString
 		var edgeCount int
-		var createTime pgtype.Timestamptz
-		var updateTime pgtype.Timestamptz
-		var verifyTime pgtype.Timestamptz
-		var disableTime pgtype.Timestamptz
-		var deviceIDs pgtype.FlatArray[string]
+		var createTime sql.NullTime
+		var updateTime sql.NullTime
+		var verifyTime sql.NullTime
+		var disableTime sql.NullTime
+		var deviceIDs []string
 
-		m := pgtype.NewMap()
-
-		err = rows.Scan(&userID, &username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, m.SQLScanner(&deviceIDs))
+		var mysqlDevices string
+		var deviceScanner any = &mysqlDevices
+		{
+			deviceScanner = &mysqlDevices
+		}
+		err = rows.Scan(&userID, &username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, deviceScanner)
 		if err != nil {
 			_ = rows.Close()
 			logger.Error("Error retrieving user accounts.", zap.Error(err))
 			return nil, err
+		}
+
+		{
+			if err := json.Unmarshal([]byte(mysqlDevices), &deviceIDs); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
 		}
 
 		devices := make([]*api.AccountDevice, 0, len(deviceIDs))
@@ -250,6 +252,10 @@ FROM users u`
 	}
 	_ = rows.Close()
 
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
 	if statusRegistry != nil {
 		statusRegistry.FillOnlineAccounts(accounts)
 	}
@@ -258,128 +264,9 @@ FROM users u`
 }
 
 func UpdateAccounts(ctx context.Context, logger *zap.Logger, db *sql.DB, updates []*accountUpdate) error {
-	if err := ExecuteInTxPgx(ctx, db, func(tx pgx.Tx) error {
-		updateErr := updateAccounts(ctx, logger, tx, updates)
-		if updateErr != nil {
-			return updateErr
-		}
-		return nil
-	}); err != nil {
-		var statusErr *statusError
-		if errors.As(err, &statusErr) {
-			return statusErr.Cause()
-		}
-		logger.Error("Error updating user accounts.", zap.Error(err))
-		return err
-	}
 
-	return nil
-}
+	return updateAccountsMySQL(ctx, db, updates)
 
-func updateAccounts(ctx context.Context, logger *zap.Logger, tx pgx.Tx, updates []*accountUpdate) error {
-	for _, update := range updates {
-		updateStatements := make([]string, 0, 7)
-		distinctStatements := make([]string, 0, 7)
-		params := make([]interface{}, 0, 8)
-
-		// Ensure user ID is always present.
-		params = append(params, update.userID)
-
-		if update.username != "" {
-			if invalidUsernameRegex.MatchString(update.username) {
-				return errors.New("Username invalid, no spaces or control characters allowed.")
-			}
-			params = append(params, update.username)
-			updateStatements = append(updateStatements, "username = $"+strconv.Itoa(len(params)))
-			distinctStatements = append(distinctStatements, "username IS DISTINCT FROM $"+strconv.Itoa(len(params)))
-		}
-
-		if update.displayName != nil {
-			if d := update.displayName.GetValue(); d == "" {
-				updateStatements = append(updateStatements, "display_name = NULL")
-				distinctStatements = append(distinctStatements, "display_name IS NOT NULL")
-			} else {
-				params = append(params, d)
-				updateStatements = append(updateStatements, "display_name = $"+strconv.Itoa(len(params)))
-				distinctStatements = append(distinctStatements, "display_name IS DISTINCT FROM $"+strconv.Itoa(len(params)))
-			}
-		}
-
-		if update.timezone != nil {
-			if t := update.timezone.GetValue(); t == "" {
-				updateStatements = append(updateStatements, "timezone = NULL")
-				distinctStatements = append(distinctStatements, "timezone IS NOT NULL")
-			} else {
-				params = append(params, t)
-				updateStatements = append(updateStatements, "timezone = $"+strconv.Itoa(len(params)))
-				distinctStatements = append(distinctStatements, "timezone IS DISTINCT FROM $"+strconv.Itoa(len(params)))
-			}
-		}
-
-		if update.location != nil {
-			if l := update.location.GetValue(); l == "" {
-				updateStatements = append(updateStatements, "location = NULL")
-				distinctStatements = append(distinctStatements, "location IS NOT NULL")
-			} else {
-				params = append(params, l)
-				updateStatements = append(updateStatements, "location = $"+strconv.Itoa(len(params)))
-				distinctStatements = append(distinctStatements, "location IS DISTINCT FROM $"+strconv.Itoa(len(params)))
-			}
-		}
-
-		if update.langTag != nil {
-			if l := update.langTag.GetValue(); l == "" {
-				updateStatements = append(updateStatements, "lang_tag = NULL")
-				distinctStatements = append(distinctStatements, "lang_tag IS NOT NULL")
-			} else {
-				params = append(params, l)
-				updateStatements = append(updateStatements, "lang_tag = $"+strconv.Itoa(len(params)))
-				distinctStatements = append(distinctStatements, "lang_tag IS DISTINCT FROM $"+strconv.Itoa(len(params)))
-			}
-		}
-
-		if update.avatarURL != nil {
-			if a := update.avatarURL.GetValue(); a == "" {
-				updateStatements = append(updateStatements, "avatar_url = NULL")
-				distinctStatements = append(distinctStatements, "avatar_url IS NOT NULL")
-			} else {
-				params = append(params, a)
-				updateStatements = append(updateStatements, "avatar_url = $"+strconv.Itoa(len(params)))
-				distinctStatements = append(distinctStatements, "avatar_url IS DISTINCT FROM $"+strconv.Itoa(len(params)))
-			}
-		}
-
-		if update.metadata != nil {
-			params = append(params, update.metadata.GetValue())
-			updateStatements = append(updateStatements, "metadata = $"+strconv.Itoa(len(params)))
-			distinctStatements = append(distinctStatements, "metadata IS DISTINCT FROM $"+strconv.Itoa(len(params)))
-		}
-
-		if len(updateStatements) == 0 {
-			return errors.New("No fields to update.")
-		}
-
-		query := "UPDATE users SET update_time = now(), " + strings.Join(updateStatements, ", ") +
-			" WHERE id = $1 AND (" + strings.Join(distinctStatements, " OR ") + ")"
-
-		if _, err := tx.Exec(ctx, query, params...); err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_username_key") {
-				return status.Error(codes.AlreadyExists, "Username is already in use.")
-			}
-
-			logger.Error("Could not update user account.", zap.Error(err),
-				zap.String("username", update.username),
-				zap.Any("display_name", update.displayName),
-				zap.Any("timezone", update.timezone),
-				zap.Any("location", update.location),
-				zap.Any("lang_tag", update.langTag),
-				zap.Any("avatar_url", update.avatarURL))
-			return err
-		}
-	}
-
-	return nil
 }
 
 func ExportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID) (*console.AccountExport, error) {
@@ -495,330 +382,22 @@ func ExportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, userID u
 	return export, nil
 }
 
-func ImportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry StatusRegistry, userID uuid.UUID, data *console.AccountExport) (*console.Account, error) {
-	var account *console.Account
-	if err := ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
-		account = nil
-
-		// Check if importing a completely new account, and create it if needed.
-		if userID == uuid.Nil && data.Account.User.Id != uuid.Nil.String() {
-			query := `
-INSERT INTO users (
-	id,
-	username,
-	display_name,
-	avatar_url,
-	lang_tag,
-	location,
-	timezone,
-	metadata,
-	wallet,
-	email,
-	password,
-	facebook_id,
-	google_id,
-	gamecenter_id,
-	steam_id,
-	custom_id,
-	create_time,
-	update_time,
-	verify_time,
-	disable_time,
-	facebook_instant_game_id,
-	apple_id
-)
-VALUES (
-	$1,
-	$2,
-	nullif(trim($3), ''),
-	nullif(trim($4), ''),
-	$5,
-	nullif(trim($6), ''),
-	nullif(trim($7), ''),
-	coalesce(nullif(trim($8), '')::jsonb, '{}'::jsonb),
-	coalesce(nullif(trim($9), '')::jsonb, '{}'::jsonb),
-	nullif(trim($10), ''),
-	nullif(trim($11), '')::bytea,
-	nullif(trim($12), ''),
-	nullif(trim($13), ''),
-	nullif(trim($14), ''),
-	nullif(trim($15), ''),
-	nullif(trim($16), ''),
-	$17,
-	$18,
-	$19,
-	$20,
-	nullif(trim($21), ''),
-	nullif(trim($22), '')
-)`
-			_, err := tx.ExecContext(ctx, query, data.Account.User.Id, data.Account.User.Username, data.Account.User.DisplayName, data.Account.User.AvatarUrl, data.Account.User.LangTag,
-				data.Account.User.Location, data.Account.User.Timezone, data.Account.User.Metadata, data.Account.Wallet, data.Account.Email, "", data.Account.User.FacebookId,
-				data.Account.User.GoogleId, data.Account.User.GamecenterId, data.Account.User.SteamId, data.Account.CustomId, data.Account.User.CreateTime.AsTime(),
-				data.Account.User.UpdateTime.AsTime(), data.Account.VerifyTime.AsTime(), data.Account.DisableTime.AsTime(), data.Account.User.FacebookInstantGameId, data.Account.User.AppleId)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
-				if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
-					if pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_pkey") {
-						return errors.New("User identifier already exists.")
-					}
-					if pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_username_key") {
-						return errors.New("Username already in use.")
-					}
-				}
-				logger.Error("Error creating user account during import", zap.Error(err), zap.String("user_id", userID.String()))
-				return err
-			}
-
-			if len(data.Account.Devices) > 0 {
-				query = `INSERT INTO user_device (id, user_id)`
-				params := []interface{}{data.Account.User.Id}
-				for _, d := range data.Account.Devices {
-					params = append(params, d.Id)
-					if l := len(params); l == 2 {
-						query += " VALUES ($2, $1)"
-					} else {
-						query += fmt.Sprintf(", ($%v, $1)", l)
-					}
-				}
-
-				_, err := tx.ExecContext(ctx, query, params...)
-				if err != nil {
-					if errors.Is(err, context.Canceled) {
-						return err
-					}
-					logger.Error("Error creating user devices during import", zap.Error(err), zap.String("user_id", userID.String()))
-					return err
-				}
-			}
-		} else {
-			query := "UPDATE users SET metadata = $1, wallet = $2 WHERE id = $3"
-			res, err := tx.ExecContext(ctx, query, data.Account.User.Metadata, data.Account.Wallet, userID.String())
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
-				logger.Error("Error updating user account during import", zap.Error(err), zap.String("user_id", userID.String()))
-				return err
-			}
-			if rowsAffected, _ := res.RowsAffected(); rowsAffected == 0 {
-				logger.Error("Error updating user account during import, no rows affected", zap.String("user_id", userID.String()))
-				return errors.New("Error updating user account during import.")
-			}
+func ImportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry StatusRegistry, userID uuid.UUID, data *console.AccountExport, indexes ...StorageIndex) (*console.Account, error) {
+	{
+		var index StorageIndex
+		if len(indexes) > 0 {
+			index = indexes[0]
 		}
-
-		// Ensure all storage objects for the user match what is in the data import.
-		if userID != uuid.Nil || data.Account.User.Id == uuid.Nil.String() {
-			// First wipe out any existing storage.
-			query := "DELETE FROM storage WHERE user_id = $1"
-			_, err := tx.ExecContext(ctx, query, userID.String())
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
-				logger.Error("Error deleting user storage during import", zap.Error(err), zap.String("user_id", userID.String()))
-				return err
-			}
-		}
-		if l := len(data.Objects); l > 0 {
-			query := `INSERT INTO storage (user_id, collection, key, "value", "version", "read", "write", create_time, update_time)`
-			params := make([]interface{}, 0, l*8+1)
-			if userID == uuid.Nil {
-				params = append(params, data.Account.User.Id)
-			} else {
-				params = append(params, userID.String())
-			}
-			for i, d := range data.Objects {
-				params = append(params, d.Collection, d.Key, d.Value, d.Version, d.PermissionRead, d.PermissionWrite, d.CreateTime.AsTime(), d.UpdateTime.AsTime())
-				if i == 0 {
-					query += fmt.Sprintf(" VALUES ($1, $%v, $%v, $%v, $%v, $%v, $%v, $%v, $%v)", i*8+2, i*8+3, i*8+4, i*8+5, i*8+6, i*8+7, i*8+8, i*8+9)
-				} else {
-					query += fmt.Sprintf(", ($1, $%v, $%v, $%v, $%v, $%v, $%v, $%v, $%v)", i*8+2, i*8+3, i*8+4, i*8+5, i*8+6, i*8+7, i*8+8, i*8+9)
-				}
-			}
-
-			res, err := tx.ExecContext(ctx, query, params...)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
-				logger.Error("Error writing user storage during import", zap.Error(err), zap.String("user_id", userID.String()))
-				return err
-			}
-			if rowsAffected, _ := res.RowsAffected(); rowsAffected != int64(l) {
-				logger.Error("Error updating user account during import, rows affected mismatch", zap.String("user_id", userID.String()), zap.Int64("rows_affected", rowsAffected), zap.Int("expected_rows", l))
-				return errors.New("Error writing user storage during import.")
-			}
-		}
-
-		// Look up the final state of the user account.
-		var lookupUserID string
-		if userID != uuid.Nil {
-			lookupUserID = userID.String()
-		} else {
-			lookupUserID = data.Account.User.Id
-		}
-		var username sql.NullString
-		var displayName sql.NullString
-		var avatarURL sql.NullString
-		var langTag sql.NullString
-		var location sql.NullString
-		var timezone sql.NullString
-		var metadata sql.NullString
-		var wallet sql.NullString
-		var email sql.NullString
-		var apple sql.NullString
-		var facebook sql.NullString
-		var facebookInstantGame sql.NullString
-		var google sql.NullString
-		var gamecenter sql.NullString
-		var steam sql.NullString
-		var customID sql.NullString
-		var edgeCount int
-		var createTime pgtype.Timestamptz
-		var updateTime pgtype.Timestamptz
-		var verifyTime pgtype.Timestamptz
-		var disableTime pgtype.Timestamptz
-		var deviceIDs pgtype.FlatArray[string]
-
-		m := pgtype.NewMap()
-
-		query := `
-SELECT u.username, u.display_name, u.avatar_url, u.lang_tag, u.location, u.timezone, u.metadata, u.wallet,
-	u.email, u.apple_id, u.facebook_id, u.facebook_instant_game_id, u.google_id, u.gamecenter_id, u.steam_id, u.custom_id, u.edge_count,
-	u.create_time, u.update_time, u.verify_time, u.disable_time, array(select ud.id from user_device ud where u.id = ud.user_id)
-FROM users u
-WHERE u.id = $1`
-
-		if err := tx.QueryRowContext(ctx, query, lookupUserID).Scan(&username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, m.SQLScanner(&deviceIDs)); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return err
-			}
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrAccountNotFound
-			}
-			logger.Error("Error retrieving user account during import", zap.Error(err), zap.String("user_id", userID.String()))
-			return err
-		}
-
-		devices := make([]*api.AccountDevice, 0, len(deviceIDs))
-		for _, deviceID := range deviceIDs {
-			devices = append(devices, &api.AccountDevice{Id: deviceID})
-		}
-
-		var verifyTimestamp *timestamppb.Timestamp
-		if verifyTime.Valid && verifyTime.Time.Unix() != 0 {
-			verifyTimestamp = &timestamppb.Timestamp{Seconds: verifyTime.Time.Unix()}
-		}
-		var disableTimestamp *timestamppb.Timestamp
-		if disableTime.Valid && disableTime.Time.Unix() != 0 {
-			disableTimestamp = &timestamppb.Timestamp{Seconds: disableTime.Time.Unix()}
-		}
-
-		online := false
-		if statusRegistry != nil {
-			online = statusRegistry.IsOnline(userID)
-		}
-
-		account = &console.Account{
-			Account: &api.Account{
-				User: &api.User{
-					Id:                    userID.String(),
-					Username:              username.String,
-					DisplayName:           displayName.String,
-					AvatarUrl:             avatarURL.String,
-					LangTag:               langTag.String,
-					Location:              location.String,
-					Timezone:              timezone.String,
-					Metadata:              metadata.String,
-					AppleId:               apple.String,
-					FacebookId:            facebook.String,
-					FacebookInstantGameId: facebookInstantGame.String,
-					GoogleId:              google.String,
-					GamecenterId:          gamecenter.String,
-					SteamId:               steam.String,
-					EdgeCount:             int32(edgeCount),
-					CreateTime:            &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
-					UpdateTime:            &timestamppb.Timestamp{Seconds: updateTime.Time.Unix()},
-					Online:                online,
-				},
-				Wallet:      wallet.String,
-				Email:       email.String,
-				Devices:     devices,
-				CustomId:    customID.String,
-				VerifyTime:  verifyTimestamp,
-				DisableTime: disableTimestamp,
-			},
-			DisableTime: disableTimestamp,
-		}
-
-		return nil
-	}); err != nil {
-		logger.Error("Error importing account.", zap.Error(err))
-		return nil, err
+		return importAccountMySQL(ctx, logger, db, statusRegistry, userID, data, index)
 	}
 
-	return account, nil
 }
 
-func DeleteAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, tracker Tracker, userID uuid.UUID, recorded bool) error {
+func DeleteAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, tracker Tracker, userID uuid.UUID, recorded bool, storageIndex StorageIndex) error {
 	if userID == uuid.Nil {
 		return errors.New("cannot delete the system user")
 	}
 
-	ts := time.Now().UTC().Unix()
+	return deleteAccountMySQL(ctx, logger, db, config, leaderboardRankCache, sessionRegistry, sessionCache, tracker, storageIndex, userID, recorded)
 
-	var deleted bool
-	if err := ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
-		count, err := DeleteUser(ctx, tx, userID)
-		if err != nil {
-			logger.Debug("Could not delete user", zap.Error(err), zap.String("user_id", userID.String()))
-			return err
-		} else if count == 0 {
-			logger.Info("No user was found to delete. Skipping blacklist.", zap.String("user_id", userID.String()))
-			return nil
-		}
-
-		err = LeaderboardRecordsDeleteAll(ctx, logger, leaderboardCache, leaderboardRankCache, tx, userID, ts)
-		if err != nil {
-			logger.Debug("Could not delete leaderboard records.", zap.Error(err), zap.String("user_id", userID.String()))
-			return err
-		}
-
-		err = GroupDeleteAll(ctx, logger, tx, userID)
-		if err != nil {
-			logger.Debug("Could not delete groups and relationships.", zap.Error(err), zap.String("user_id", userID.String()))
-			return err
-		}
-
-		if recorded {
-			_, err = tx.ExecContext(ctx, `INSERT INTO user_tombstone (user_id) VALUES ($1) ON CONFLICT(user_id) DO NOTHING`, userID)
-			if err != nil {
-				logger.Debug("Could not insert user ID into tombstone", zap.Error(err), zap.String("user_id", userID.String()))
-				return err
-			}
-		}
-
-		deleted = true
-
-		return nil
-	}); err != nil {
-		logger.Error("Error occurred while trying to delete the user.", zap.Error(err), zap.String("user_id", userID.String()))
-		return err
-	}
-
-	if deleted {
-		// Logout and disconnect.
-		if err := SessionLogout(config, sessionCache, userID, "", ""); err != nil {
-			return err
-		}
-		for _, presence := range tracker.ListPresenceIDByStream(PresenceStream{Mode: StreamModeNotifications, Subject: userID}) {
-			if err := sessionRegistry.Disconnect(ctx, presence.SessionID, false); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
 }

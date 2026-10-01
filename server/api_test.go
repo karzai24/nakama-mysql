@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: selectable test database fixtures.
 // Copyright 2017 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,7 +34,7 @@ import (
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/apigrpc"
-	_ "github.com/jackc/pgx/v5/stdlib"
+
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
@@ -171,21 +172,26 @@ func NewConsoleLogger(output *os.File, verbose bool) *zap.Logger {
 }
 
 func NewDB(t *testing.T) *sql.DB {
-	//dbUrl := "postgresql://postgres@127.0.0.1:5432/nakama?sslmode=disable"
-	dbUrl := "postgresql://root@127.0.0.1:26257/nakama?sslmode=disable"
-	if dbUrlEnv := os.Getenv("TEST_DB_URL"); len(dbUrlEnv) > 0 {
-		dbUrl = dbUrlEnv
+	{
+		config := NewConfig(logger)
+		config.GetDatabase().Backend = "mysql"
+		config.GetDatabase().Addresses = []string{os.Getenv("TEST_DB_URL")}
+		mysqlConfig, err := DbMySQLConfig(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db, err := openMySQL(mysqlConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Ping(); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return db
 	}
 
-	db, err := sql.Open("pgx", dbUrl)
-	if err != nil {
-		t.Fatal("Error connecting to database", err)
-	}
-	err = db.Ping()
-	if err != nil {
-		t.Fatal("Error pinging database", err)
-	}
-	return db
 }
 
 func GenerateString() string {
@@ -193,12 +199,13 @@ func GenerateString() string {
 }
 
 func InsertUser(t *testing.T, db *sql.DB, uid uuid.UUID) {
-	if _, err := db.Exec(`
-INSERT INTO users (id, username)
-VALUES ($1, $2)
-ON CONFLICT(id) DO NOTHING`, uid, uid.String()); err != nil {
-		t.Fatal("Could not insert new user.", err)
+	{
+		if _, err := db.Exec("INSERT INTO users (id, username) VALUES (?, ?) ON DUPLICATE KEY UPDATE id = id", uid.String(), uid.String()); err != nil {
+			t.Fatal(err)
+		}
+		return
 	}
+
 }
 
 func WaitForSocket(expected error, cfg *config) {

@@ -15,17 +15,15 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
-	"encoding/gob"
+
 	"encoding/json"
 	"errors"
-	"fmt"
+
 	"net/http"
-	"slices"
-	"strconv"
+
 	"strings"
 	"time"
 
@@ -38,7 +36,6 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var (
@@ -367,7 +364,13 @@ func consoleAuditLogInterceptor(logger *zap.Logger, db *sql.DB) func(context.Con
 			case "/nakama.console.Console/UpdateAccount":
 				action = console.AuditLogAction_UPDATE
 				resource = console.AclResources_ACCOUNT
-				metadata, mErr = auditLogMarshaller.Marshal(msg)
+				// Record that the password changed without retaining the credential.
+				// Clone so auditing cannot mutate the caller's request.
+				redacted := proto.Clone(msg).(*console.UpdateAccountRequest)
+				if redacted.Password != nil {
+					redacted.Password.Value = "[REDACTED]"
+				}
+				metadata, mErr = auditLogMarshaller.Marshal(redacted)
 				log = "player account data updated"
 			case "/nakama.console.Console/UpdateAclTemplate":
 				action = console.AuditLogAction_UPDATE
@@ -394,7 +397,7 @@ func consoleAuditLogInterceptor(logger *zap.Logger, db *sql.DB) func(context.Con
 				resource = console.AclResources_STORAGE_DATA
 				metadata, mErr = auditLogMarshaller.Marshal(msg)
 				log = "storage object was updated"
-			case "/nakama.console.Console/SendNotificationRequest":
+			case "/nakama.console.Console/SendNotification":
 				action = console.AuditLogAction_CREATE
 				resource = console.AclResources_NOTIFICATION
 				metadata, mErr = auditLogMarshaller.Marshal(msg)
@@ -559,11 +562,7 @@ func auditLogAdd(logger *zap.Logger, db *sql.DB, entry *AuditLogEntry) error {
 		entry.ID = uuid.Must(uuid.NewV4()).String()
 	}
 
-	query := `
-		INSERT INTO console_audit_log (
-			id, console_user_id, console_username, email, resource, action, metadata, message, create_time
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-
+	query := "INSERT INTO console_audit_log (id,console_user_id,console_username,email,resource,action,metadata,message,create_time) VALUES (?,?,?,?,?,?,?,?,?)"
 	_, err := db.Exec(
 		query,
 		entry.ID,
@@ -586,12 +585,13 @@ func auditLogAdd(logger *zap.Logger, db *sql.DB, entry *AuditLogEntry) error {
 }
 
 type auditLogListCursor struct {
-	Timestamp time.Time
-	Username  string
-	Resource  console.AclResources
-	Action    console.AuditLogAction
-	ID        string
-	IsNext    bool
+	ResourceFilterSet bool
+	Timestamp         time.Time
+	Username          string
+	Resource          console.AclResources
+	Action            console.AuditLogAction
+	ID                string
+	IsNext            bool
 
 	// Filter state to ensure consistent pagination
 	UsernameFilter string
@@ -603,262 +603,7 @@ type auditLogListCursor struct {
 
 // auditLogEntryList retrieves audit log entries with bidirectional keyset pagination and filtering
 func auditLogEntryList(ctx context.Context, logger *zap.Logger, db *sql.DB, username string, action console.AuditLogAction, resource *console.AclResources, after, before time.Time, limit int, cursor string) (*console.AuditLogList, error) {
-	var incomingCursor *auditLogListCursor
-	if cursor != "" {
-		// Decode the cursor
-		cb, err := base64.URLEncoding.DecodeString(cursor)
-		if err != nil {
-			return nil, ErrAuditLogInvalidCursor
-		}
-		incomingCursor = &auditLogListCursor{}
-		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
-			return nil, ErrAuditLogInvalidCursor
-		}
 
-		// Validate cursor is compatible with the current request filters
-		if username != "" && username != incomingCursor.UsernameFilter {
-			return nil, ErrAuditLogInvalidCursor
-		}
-		if action != 0 && action != incomingCursor.ActionFilter {
-			return nil, ErrAuditLogInvalidCursor
-		}
-		if resource != nil && incomingCursor.ResourceFilter != nil && *resource.Enum() != *incomingCursor.ResourceFilter {
-			return nil, ErrAuditLogInvalidCursor
-		}
-		if !before.Equal(incomingCursor.AfterFilter) {
-			return nil, ErrAuditLogInvalidCursor
-		}
-		if !after.Equal(incomingCursor.BeforeFilter) {
-			return nil, ErrAuditLogInvalidCursor
-		}
-	}
+	return auditLogEntryListMySQL(ctx, logger, db, username, action, resource, after, before, limit, cursor)
 
-	query := `
-SELECT
-	id,
-	console_user_id,
-	console_username,
-	email,
-	resource,
-	action,
-	metadata,
-	message,
-	create_time
-FROM
-	console_audit_log`
-
-	var order string
-	params := make([]interface{}, 0, 10)
-
-	// Build the WHERE clause based on the cursor and filters
-	if incomingCursor != nil {
-		whereClause := ""
-
-		// Add cursor-based pagination constraints
-		if incomingCursor.IsNext {
-			// Next page (older entries) - create_time DESC order
-			whereClause = "(create_time, console_username, action, resource, id) < ($1, $2, $3, $4, $5)"
-			order = " ORDER BY create_time DESC, console_username DESC, action DESC, resource DESC, id DESC"
-		} else {
-			// Previous page (newer entries) - create_time ASC order
-			whereClause = "(create_time, console_username, action, resource, id) > ($1, $2, $3, $4, $5)"
-			order = " ORDER BY create_time ASC, console_username ASC, action ASC, resource ASC, id ASC"
-		}
-
-		params = append(params,
-			incomingCursor.Timestamp,
-			incomingCursor.Username,
-			incomingCursor.Action,
-			incomingCursor.Resource,
-			incomingCursor.ID)
-
-		// Apply filters if provided
-		filterConditions := []string{whereClause}
-
-		if incomingCursor.UsernameFilter != "" {
-			filterConditions = append(filterConditions, "console_username = $"+strconv.Itoa(len(params)+1))
-			params = append(params, incomingCursor.UsernameFilter)
-		}
-
-		if incomingCursor.ActionFilter != 0 {
-			filterConditions = append(filterConditions, "action = $"+strconv.Itoa(len(params)+1))
-			params = append(params, incomingCursor.ActionFilter)
-		}
-
-		if incomingCursor.ResourceFilter != nil {
-			filterConditions = append(filterConditions, "resource = $"+strconv.Itoa(len(params)+1))
-			params = append(params, *incomingCursor.ResourceFilter.Enum())
-		}
-
-		if !incomingCursor.AfterFilter.IsZero() {
-			filterConditions = append(filterConditions, "create_time > $"+strconv.Itoa(len(params)+1))
-			params = append(params, incomingCursor.AfterFilter)
-		}
-
-		if !incomingCursor.BeforeFilter.IsZero() {
-			filterConditions = append(filterConditions, "create_time < $"+strconv.Itoa(len(params)+1))
-			params = append(params, incomingCursor.BeforeFilter)
-		}
-
-		query += " WHERE " + strings.Join(filterConditions, " AND ")
-	} else {
-		// No cursor - initial query
-		filterConditions := []string{}
-
-		if username != "" {
-			filterConditions = append(filterConditions, "console_username = $"+strconv.Itoa(len(params)+1))
-			params = append(params, username)
-		}
-
-		if action != 0 {
-			filterConditions = append(filterConditions, "action = $"+strconv.Itoa(len(params)+1))
-			params = append(params, action)
-		}
-
-		if resource != nil {
-			filterConditions = append(filterConditions, "resource = $"+strconv.Itoa(len(params)+1))
-			params = append(params, *resource.Enum())
-		}
-
-		if !after.IsZero() {
-			filterConditions = append(filterConditions, "create_time > $"+strconv.Itoa(len(params)+1))
-			params = append(params, after)
-		}
-
-		if !before.IsZero() {
-			filterConditions = append(filterConditions, "create_time < $"+strconv.Itoa(len(params)+1))
-			params = append(params, before)
-		}
-
-		if len(filterConditions) > 0 {
-			query += " WHERE " + strings.Join(filterConditions, " AND ")
-		}
-
-		// Default order for initial query
-		order = " ORDER BY create_time DESC, console_username DESC, action DESC, resource DESC, id DESC"
-	}
-
-	// Add order to query
-	query += order
-
-	// Add 1 to check if there are more results
-	params = append(params, limit+1)
-	query += fmt.Sprintf(" LIMIT $%d", len(params))
-
-	rows, err := db.QueryContext(ctx, query, params...)
-	if err != nil {
-		logger.Error("Error retrieving audit logs", zap.Error(err))
-		return nil, err
-	}
-	defer rows.Close()
-
-	var nextCursor *auditLogListCursor
-	var prevCursor *auditLogListCursor
-	auditLogs := make([]*console.AuditLogList_AuditLog, 0, limit)
-
-	var id, dbUserID, dbUsername, email, metadata, message string
-	var dbResource, dbAction int32
-	var timestamp time.Time
-
-	for rows.Next() {
-		if len(auditLogs) >= limit {
-			nextCursor = &auditLogListCursor{
-				ID:             id,
-				Username:       dbUsername,
-				Action:         console.AuditLogAction(dbAction),
-				Resource:       console.AclResources(dbResource),
-				Timestamp:      timestamp,
-				IsNext:         true,
-				UsernameFilter: username,
-				ActionFilter:   action,
-				ResourceFilter: resource,
-			}
-			break
-		}
-
-		var dbResourceStr, dbActionStr string
-		if err = rows.Scan(&id, &dbUserID, &dbUsername, &email, &dbResourceStr, &dbActionStr, &metadata, &message, &timestamp); err != nil {
-			logger.Error("Error scanning audit log entry", zap.Error(err))
-			return nil, err
-		}
-
-		dbResource = console.AclResources_value[dbResourceStr]
-		dbAction = console.AuditLogAction_value[dbActionStr]
-
-		auditLog := &console.AuditLogList_AuditLog{
-			Id:        id,
-			UserId:    dbUserID,
-			Username:  dbUsername,
-			Email:     email,
-			Resource:  console.AclResources(dbResource),
-			Action:    console.AuditLogAction(dbAction),
-			Metadata:  metadata,
-			Message:   message,
-			Timestamp: timestamppb.New(timestamp),
-		}
-
-		auditLogs = append(auditLogs, auditLog)
-
-		if incomingCursor != nil && prevCursor == nil {
-			// First row becomes the previous cursor
-			prevCursor = &auditLogListCursor{
-				ID:             id,
-				Username:       dbUsername,
-				Action:         console.AuditLogAction(dbAction),
-				Resource:       console.AclResources(dbResource),
-				Timestamp:      timestamp,
-				IsNext:         false,
-				UsernameFilter: username,
-				ActionFilter:   action,
-				ResourceFilter: resource,
-			}
-		}
-	}
-	if err = rows.Err(); err != nil {
-		logger.Error("Error iterating audit log rows", zap.Error(err))
-		return nil, err
-	}
-	_ = rows.Close()
-
-	// If we were paginating backwards (using a prev cursor), we need to reverse the results
-	if incomingCursor != nil && !incomingCursor.IsNext {
-		if nextCursor != nil && prevCursor != nil {
-			nextCursor, nextCursor.IsNext, prevCursor, prevCursor.IsNext = prevCursor, prevCursor.IsNext, nextCursor, nextCursor.IsNext
-		} else if nextCursor != nil {
-			nextCursor, prevCursor = nil, nextCursor
-			prevCursor.IsNext = !prevCursor.IsNext
-		} else if prevCursor != nil {
-			nextCursor, prevCursor = prevCursor, nil
-			nextCursor.IsNext = !nextCursor.IsNext
-		}
-
-		slices.Reverse(auditLogs)
-	}
-
-	// Encode the cursors
-	var nextCursorStr string
-	if nextCursor != nil {
-		cursorBuf := new(bytes.Buffer)
-		if err := gob.NewEncoder(cursorBuf).Encode(nextCursor); err != nil {
-			logger.Error("Error creating audit log list cursor", zap.Error(err))
-			return nil, err
-		}
-		nextCursorStr = base64.URLEncoding.EncodeToString(cursorBuf.Bytes())
-	}
-
-	var prevCursorStr string
-	if prevCursor != nil {
-		cursorBuf := new(bytes.Buffer)
-		if err := gob.NewEncoder(cursorBuf).Encode(prevCursor); err != nil {
-			logger.Error("Error creating audit log list cursor", zap.Error(err))
-			return nil, err
-		}
-		prevCursorStr = base64.URLEncoding.EncodeToString(cursorBuf.Bytes())
-	}
-
-	return &console.AuditLogList{
-		Entries:    auditLogs,
-		NextCursor: nextCursorStr,
-		PrevCursor: prevCursorStr,
-	}, nil
 }

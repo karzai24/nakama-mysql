@@ -101,7 +101,7 @@ func loLoaderLua(L *LState) int {
 	}
 	fn, err1 := L.LoadFile(path)
 	if err1 != nil {
-		L.RaiseError(err1.Error())
+		L.RaiseError("%s", err1.Error())
 	}
 	L.Push(fn)
 	return 1

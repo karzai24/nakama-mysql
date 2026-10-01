@@ -1,0 +1,6 @@
+{
+  "all": {
+    "internal/satori/TestSatoriClient_EventsPublish": "Inherited live-service test needs real Satori credentials; no external service is contacted.",
+    "internal/satori/TestSatoriClientMemory": "Inherited exploratory live-service memory test needs real Satori credentials."
+  }
+}

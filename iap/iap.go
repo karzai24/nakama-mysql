@@ -795,8 +795,8 @@ func ValidateReceiptHuawei(ctx context.Context, httpc *http.Client, pubKey, clie
 	}
 
 	u := &url.URL{
-		Host:   rootUrl,
-		Path:   fmt.Sprintf("%s/applications/purchases/tokens/verify", rootUrl),
+		Host:   strings.TrimPrefix(rootUrl, "https://"),
+		Path:   "/applications/purchases/tokens/verify",
 		Scheme: "https",
 	}
 
@@ -820,6 +820,7 @@ func ValidateReceiptHuawei(ctx context.Context, httpc *http.Client, pubKey, clie
 		return nil, nil, nil, err
 	}
 
+	defer res.Body.Close()
 	buf, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, data, nil, err

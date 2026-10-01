@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL account lifecycle integration.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +25,7 @@ import (
 	"errors"
 	"html"
 	"regexp"
+
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +33,7 @@ import (
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
@@ -96,7 +98,7 @@ func (s *ConsoleServer) DeleteAccount(ctx context.Context, in *console.AccountDe
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid user ID.")
 	}
 
-	if err = DeleteAccount(ctx, logger, s.db, s.config, s.leaderboardCache, s.leaderboardRankCache, s.sessionRegistry, s.sessionCache, s.tracker, userID, in.RecordDeletion != nil && in.RecordDeletion.Value); err != nil {
+	if err = DeleteAccount(ctx, logger, s.db, s.config, s.leaderboardCache, s.leaderboardRankCache, s.sessionRegistry, s.sessionCache, s.tracker, userID, in.RecordDeletion != nil && in.RecordDeletion.Value, s.storageIndex); err != nil {
 		// Error already logged in function above.
 		return nil, status.Error(codes.Internal, "An error occurred while trying to delete the user.")
 	}
@@ -106,14 +108,9 @@ func (s *ConsoleServer) DeleteAccount(ctx context.Context, in *console.AccountDe
 
 // Deprecated: replaced by DeleteAllData
 func (s *ConsoleServer) DeleteAccounts(ctx context.Context, in *emptypb.Empty) (*emptypb.Empty, error) {
-	// Delete all but the system user. Related data will be removed by cascading constraints.
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	_, err := s.db.ExecContext(ctx, "DELETE FROM users WHERE id <> '00000000-0000-0000-0000-000000000000'")
-	if err != nil {
-		logger.Error("Error deleting all user accounts.", zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to delete all users.")
-	}
-	return &emptypb.Empty{}, nil
+
+	return s.deleteAccountsMySQL(ctx)
+
 }
 
 func (s *ConsoleServer) DeleteFriend(ctx context.Context, in *console.DeleteFriendRequest) (*emptypb.Empty, error) {
@@ -176,7 +173,8 @@ func (s *ConsoleServer) DeleteWalletLedger(ctx context.Context, in *console.Dele
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid wallet ledger item ID.")
 	}
 
-	_, err = s.db.ExecContext(ctx, "DELETE FROM wallet_ledger WHERE id = $1 AND user_id = $2", walletID, userID)
+	query := "DELETE FROM wallet_ledger WHERE id = ? AND user_id = ?"
+	_, err = s.db.ExecContext(ctx, query, walletID, userID)
 	if err != nil {
 		logger.Error("Error deleting from wallet ledger.", zap.String("id", walletID.String()), zap.String("user_id", userID.String()), zap.Error(err))
 		return nil, status.Error(codes.Internal, "An error occurred while trying to remove the user's wallet ledger item.")
@@ -206,21 +204,21 @@ func (s *ConsoleServer) ImportAccount(ctx context.Context, in *console.AccountIm
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid user ID.")
 	}
 
-	if _, err := ImportAccount(ctx, logger, s.db, s.statusRegistry, userID, in.Data); err != nil {
-		return nil, err
+	{
+		_, err := importAccountMySQL(ctx, logger, s.db, s.statusRegistry, userID, in.Data, s.storageIndex)
+		if err != nil {
+			return nil, err
+		}
+		return &emptypb.Empty{}, nil
 	}
 
-	return &emptypb.Empty{}, nil
 }
 
 func (s *ConsoleServer) ImportAccountFull(ctx context.Context, in *console.AccountImport) (*console.Account, error) {
 	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	account, err := ImportAccount(ctx, logger, s.db, s.statusRegistry, uuid.Nil, in.Data)
-	if err != nil {
-		return nil, err
-	}
 
-	return account, nil
+	return importAccountMySQL(ctx, logger, s.db, s.statusRegistry, uuid.Nil, in.Data, s.storageIndex)
+
 }
 
 func (s *ConsoleServer) GetAccount(ctx context.Context, in *console.AccountId) (*console.Account, error) {
@@ -337,295 +335,9 @@ func (s *ConsoleServer) GetWalletLedger(ctx context.Context, in *console.GetWall
 }
 
 func (s *ConsoleServer) ListAccounts(ctx context.Context, in *console.ListAccountsRequest) (*console.AccountList, error) {
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	const defaultLimit = 50
 
-	// Searching only through tombstone records.
-	if in.Tombstones {
-		var userID *uuid.UUID
-		if in.Filter != "" {
-			uid, err := uuid.FromString(in.Filter)
-			if err != nil {
-				// Filtering for a tombstone using username, no results are possible.
-				return &console.AccountList{
-					TotalCount: 0,
-				}, nil
-			}
-			userID = &uid
-		}
+	return s.listAccountsMySQL(ctx, in)
 
-		if userID != nil {
-			// Looking up a single specific tombstone.
-			var createTime pgtype.Timestamptz
-			err := s.db.QueryRowContext(ctx, "SELECT create_time FROM user_tombstone WHERE user_id = $1", *userID).Scan(&createTime)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return &console.AccountList{
-						TotalCount: 0,
-					}, nil
-				}
-				logger.Error("Error looking up user tombstone.", zap.Any("in", in), zap.Error(err))
-				return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-			}
-
-			return &console.AccountList{
-				Users: []*api.User{
-					{
-						Id:         in.Filter,
-						UpdateTime: &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
-					},
-				},
-				TotalCount: 1,
-			}, nil
-		}
-
-		query := "SELECT user_id, create_time FROM user_tombstone LIMIT $1"
-		rows, err := s.db.QueryContext(ctx, query, defaultLimit)
-		if err != nil {
-			logger.Error("Error querying user tombstones.", zap.Any("in", in), zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-		}
-
-		users := make([]*api.User, 0, defaultLimit)
-
-		for rows.Next() {
-			var id string
-			var createTime pgtype.Timestamptz
-			if err = rows.Scan(&id, &createTime); err != nil {
-				_ = rows.Close()
-				logger.Error("Error scanning user tombstones.", zap.Any("in", in), zap.Error(err))
-				return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-			}
-
-			users = append(users, &api.User{
-				Id:         id,
-				UpdateTime: &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
-			})
-		}
-		_ = rows.Close()
-
-		return &console.AccountList{
-			Users:      users,
-			TotalCount: countDatabase(ctx, logger, s.db, "user_tombstone"),
-		}, nil
-	}
-
-	// Listing live (non-tombstone) users.
-	// Validate cursor, if provided. Only applies for non-filtered listings.
-	var cursor *consoleAccountCursor
-	if in.Filter == "" && in.Cursor != "" {
-		cb, err := base64.RawURLEncoding.DecodeString(in.Cursor)
-		if err != nil {
-			logger.Error("Error decoding account list cursor.", zap.String("cursor", in.Cursor), zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to decode account list request cursor.")
-		}
-		cursor = &consoleAccountCursor{}
-		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(&cursor); err != nil {
-			logger.Error("Error decoding account list cursor.", zap.String("cursor", in.Cursor), zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to decode account list request cursor.")
-		}
-	}
-
-	// If a filter is supplied, check if it's a valid user ID.
-	var userIDFilter *uuid.UUID
-	if in.Filter != "" {
-		userID, err := uuid.FromString(in.Filter)
-		if err == nil {
-			userIDFilter = &userID
-		}
-	}
-
-	limit := defaultLimit
-
-	// Filtered queries do not observe cursor or limit inputs, and do not return cursors.
-	if in.Filter != "" {
-		// Exact match based on username or social identifiers, if any.
-		params := []interface{}{in.Filter}
-		query := `
-			SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
-				FROM users
-				WHERE username = $1
-					OR facebook_id = $1
-					OR google_id = $1
-					OR gamecenter_id = $1
-					OR steam_id = $1
-					OR custom_id = $1
-				  OR facebook_instant_game_id = $1
-					OR apple_id = $1
-					OR email = $1
-			UNION
-			SELECT u.id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
-      	FROM users u JOIN user_device ud on u.id = ud.user_id
-      	WHERE ud.id = $1
-		`
-		if len(in.Filter) >= 3 && !s.config.GetConsole().DisableDisplayNameSearch {
-			query += `
-				UNION
-				(SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
-					FROM users
-					WHERE display_name ILIKE CONCAT('%', replace(replace(replace($1, '\', '\\'), '%', '\%'), '_', '\_'), '%')
-           LIMIT 100)
-			`
-		}
-		if userIDFilter != nil {
-			params = append(params, *userIDFilter)
-			query += `
-				UNION
-				SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
-        	FROM users
-					WHERE id = $2`
-		}
-
-		users := make([]*api.User, 0, defaultLimit)
-
-		rows, err := s.db.QueryContext(ctx, query, params...)
-		if err != nil {
-			logger.Error("Error querying users.", zap.Any("in", in), zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-		}
-
-		for rows.Next() {
-			user, err := convertUser(rows)
-			if err != nil {
-				_ = rows.Close()
-				logger.Error("Error scanning users.", zap.Any("in", in), zap.Error(err))
-				return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-			}
-
-			user.DisplayName = html.EscapeString(user.DisplayName)
-			user.AvatarUrl = html.EscapeString(user.AvatarUrl)
-			user.LangTag = html.EscapeString(user.LangTag)
-			user.Location = html.EscapeString(user.Location)
-			user.Timezone = html.EscapeString(user.Timezone)
-
-			users = append(users, user)
-		}
-		_ = rows.Close()
-
-		// Secondary query for fuzzy matching, if the filter is eligible.
-		// Executed separately due to cost of query - enables separate limits and potentially extended context deadline.
-		if strings.Contains(in.Filter, "%") && validTrigramFilterRegex.MatchString(in.Filter) {
-			params = []interface{}{in.Filter, limit - len(users)}
-			query = `
-		SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
-        FROM users
-				WHERE username ILIKE $1
-				LIMIT $2`
-
-			rows, err := s.db.QueryContext(ctx, query, params...)
-			if err != nil {
-				logger.Error("Error querying users.", zap.Any("in", in), zap.Error(err))
-				return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-			}
-
-			for rows.Next() {
-				user, err := convertUser(rows)
-				if err != nil {
-					_ = rows.Close()
-					logger.Error("Error scanning users.", zap.Any("in", in), zap.Error(err))
-					return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-				}
-
-				user.DisplayName = html.EscapeString(user.DisplayName)
-				user.AvatarUrl = html.EscapeString(user.AvatarUrl)
-				user.LangTag = html.EscapeString(user.LangTag)
-				user.Location = html.EscapeString(user.Location)
-				user.Timezone = html.EscapeString(user.Timezone)
-
-				users = append(users, user)
-			}
-			_ = rows.Close()
-
-			// De-duplicate users in case of overlaps between the two queries.
-			seenUserIDs := make(map[string]struct{}, len(users))
-			for i := 0; i < len(users); i++ {
-				if _, seen := seenUserIDs[users[i].Id]; seen {
-					users = append(users[:i], users[i+1:]...)
-					i--
-					continue
-				}
-				seenUserIDs[users[i].Id] = struct{}{}
-			}
-		}
-
-		s.statusRegistry.FillOnlineUsers(users)
-
-		return &console.AccountList{
-			Users:      users,
-			TotalCount: countDatabase(ctx, logger, s.db, "users"),
-		}, nil
-	}
-
-	var params []interface{}
-	var query string
-
-	// Non-filtered query, pagination possible.
-	switch {
-	case cursor != nil:
-		// Non-filtered, but paginated query. Assume pagination on user ID. Querying and paginating on primary key (id).
-		query = "SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time FROM users WHERE id > $1 ORDER BY id ASC LIMIT $2"
-		params = []interface{}{cursor.ID, limit + 1}
-	default:
-		// Non-filtered, non-paginated query. Querying and paginating on primary key (id).
-		query = "SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time FROM users ORDER BY id ASC LIMIT $1"
-		params = []interface{}{limit + 1}
-	}
-
-	rows, err := s.db.QueryContext(ctx, query, params...)
-	if err != nil {
-		logger.Error("Error querying users.", zap.Any("in", in), zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-	}
-
-	users := make([]*api.User, 0, defaultLimit)
-	var nextCursor *consoleAccountCursor
-	var previousUser *api.User
-
-	for rows.Next() {
-		// Checks limit before processing for the edge case where (last page == limit) => null cursor.
-		if len(users) >= limit {
-			nextCursor = &consoleAccountCursor{
-				ID:       uuid.FromStringOrNil(previousUser.Id),
-				Username: previousUser.Username,
-			}
-			break
-		}
-
-		user, err := convertUser(rows)
-		if err != nil {
-			_ = rows.Close()
-			logger.Error("Error scanning users.", zap.Any("in", in), zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-		}
-
-		user.DisplayName = html.EscapeString(user.DisplayName)
-		user.AvatarUrl = html.EscapeString(user.AvatarUrl)
-		user.LangTag = html.EscapeString(user.LangTag)
-		user.Location = html.EscapeString(user.Location)
-		user.Timezone = html.EscapeString(user.Timezone)
-
-		users = append(users, user)
-		previousUser = user
-	}
-	_ = rows.Close()
-
-	s.statusRegistry.FillOnlineUsers(users)
-
-	response := &console.AccountList{
-		Users:      users,
-		TotalCount: countDatabase(ctx, logger, s.db, "users"),
-	}
-
-	if nextCursor != nil {
-		cursorBuf := &bytes.Buffer{}
-		if err := gob.NewEncoder(cursorBuf).Encode(nextCursor); err != nil {
-			logger.Error("Error encoding users cursor.", zap.Any("in", in), zap.Error(err))
-			return nil, status.Error(codes.Internal, "An error occurred while trying to list users.")
-		}
-		response.NextCursor = base64.RawURLEncoding.EncodeToString(cursorBuf.Bytes())
-	}
-
-	return response, nil
 }
 
 func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAccountRequest) (*emptypb.Empty, error) {
@@ -733,7 +445,7 @@ func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAcc
 			} else if len(e) < 10 || len(e) > 255 {
 				return nil, status.Error(codes.InvalidArgument, "Invalid email address, must be 10-255 bytes.")
 			} else {
-				params = append(params, e)
+				params = append(params, strings.ToLower(e))
 				statements = append(statements, "email = $"+strconv.Itoa(len(params)))
 			}
 		}
@@ -755,7 +467,7 @@ func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAcc
 
 	if v := in.Wallet; v != nil && v.Value != "" {
 		var walletMap map[string]int64
-		if err := json.Unmarshal([]byte(v.Value), &walletMap); err != nil {
+		if err := json.Unmarshal([]byte(v.Value), &walletMap); err != nil || walletMap == nil {
 			return nil, status.Error(codes.InvalidArgument, "Wallet must be a valid JSON object with only string keys and integer values.")
 		}
 		for k, v := range walletMap {
@@ -789,143 +501,11 @@ func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAcc
 		return &emptypb.Empty{}, nil
 	}
 
-	if err = ExecuteInTx(ctx, s.db, func(tx *sql.Tx) error {
-		for oldDeviceID, newDeviceID := range in.DeviceIds {
-			if newDeviceID == "" {
-				query := `DELETE FROM user_device WHERE id = $2 AND user_id = $1
-AND (EXISTS (SELECT id FROM users WHERE id = $1 AND
-    (apple_id IS NOT NULL
-     OR facebook_id IS NOT NULL
-     OR facebook_instant_game_id IS NOT NULL
-     OR google_id IS NOT NULL
-     OR gamecenter_id IS NOT NULL
-     OR steam_id IS NOT NULL
-     OR email IS NOT NULL
-     OR custom_id IS NOT NULL))
-   OR EXISTS (SELECT id FROM user_device WHERE user_id = $1 AND id <> $2 LIMIT 1))`
+	return s.updateAccountMySQL(ctx, userID, in, newPassword)
 
-				res, err := tx.ExecContext(ctx, query, userID, oldDeviceID)
-				if err != nil {
-					logger.Error("Could not unlink device ID.", zap.Error(err), zap.Any("input", in))
-					return err
-				}
-				if count, _ := res.RowsAffected(); count == 0 {
-					return StatusError(codes.InvalidArgument, "Cannot unlink device ID when there are no other identifiers.", ErrRowsAffectedCount)
-				}
-			} else {
-				query := `UPDATE user_device SET id = $1 WHERE id = $2 AND user_id = $3`
-				res, err := tx.ExecContext(ctx, query, newDeviceID, oldDeviceID, userID)
-				if err != nil {
-					logger.Error("Could not update device ID.", zap.Error(err), zap.Any("input", in))
-					return err
-				}
-				if count, _ := res.RowsAffected(); count == 0 {
-					return StatusError(codes.InvalidArgument, "Device ID is already linked to a different user.", ErrRowsAffectedCount)
-				}
-			}
-		}
-
-		if len(statements) != 0 {
-			query := "UPDATE users SET update_time = now(), " + strings.Join(statements, ", ") + " WHERE id = $1"
-			_, err := tx.ExecContext(ctx, query, params...)
-			if err != nil {
-				logger.Error("Could not update user account.", zap.Error(err), zap.Any("input", in))
-				return err
-			}
-		}
-
-		if removeCustomID && removeEmail {
-			query := `UPDATE users SET custom_id = NULL, email = NULL, update_time = now()
-WHERE id = $1
-AND ((facebook_id IS NOT NULL
-      OR google_id IS NOT NULL
-      OR gamecenter_id IS NOT NULL
-      OR steam_id IS NOT NULL)
-     OR
-     EXISTS (SELECT id FROM user_device WHERE user_id = $1 LIMIT 1))`
-
-			res, err := tx.ExecContext(ctx, query, userID)
-			if err != nil {
-				return err
-			}
-			if rowsAffected, _ := res.RowsAffected(); rowsAffected == 0 {
-				return StatusError(codes.InvalidArgument, "Cannot unlink both custom ID and email address when there are no other identifiers.", ErrRowsAffectedCount)
-			}
-		} else if removeCustomID {
-			query := `UPDATE users SET custom_id = NULL, update_time = now()
-WHERE id = $1
-AND ((facebook_id IS NOT NULL
-      OR google_id IS NOT NULL
-      OR gamecenter_id IS NOT NULL
-      OR steam_id IS NOT NULL
-      OR email IS NOT NULL)
-     OR
-     EXISTS (SELECT id FROM user_device WHERE user_id = $1 LIMIT 1))`
-
-			res, err := tx.ExecContext(ctx, query, userID)
-			if err != nil {
-				return err
-			}
-			if rowsAffected, _ := res.RowsAffected(); rowsAffected == 0 {
-				return StatusError(codes.InvalidArgument, "Cannot unlink custom ID when there are no other identifiers.", ErrRowsAffectedCount)
-			}
-		} else if removeEmail {
-			query := `UPDATE users SET email = NULL, password = NULL, update_time = now()
-WHERE id = $1
-AND ((facebook_id IS NOT NULL
-      OR google_id IS NOT NULL
-      OR gamecenter_id IS NOT NULL
-      OR steam_id IS NOT NULL
-      OR custom_id IS NOT NULL)
-     OR
-     EXISTS (SELECT id FROM user_device WHERE user_id = $1 LIMIT 1))`
-
-			res, err := tx.ExecContext(ctx, query, userID)
-			if err != nil {
-				return err
-			}
-			if rowsAffected, _ := res.RowsAffected(); rowsAffected == 0 {
-				return StatusError(codes.InvalidArgument, "Cannot unlink email address when there are no other identifiers.", ErrRowsAffectedCount)
-			}
-		}
-
-		if len(newPassword) != 0 {
-			// Update the password on the user account only if they have an email associated.
-			res, err := tx.ExecContext(ctx, "UPDATE users SET password = $2, update_time = now() WHERE id = $1 AND email IS NOT NULL", userID, newPassword)
-			if err != nil {
-				logger.Error("Could not update password.", zap.Error(err), zap.Any("user_id", userID))
-				return err
-			}
-			if rowsAffected, _ := res.RowsAffected(); rowsAffected != 1 {
-				return StatusError(codes.InvalidArgument, "Cannot set a password on an account with no email address.", ErrRowsAffectedCount)
-			}
-		}
-
-		if len(in.DeviceIds) != 0 && len(statements) == 0 && !removeCustomID && !removeEmail && len(newPassword) == 0 {
-			// Ensure the user account update time is touched if the device IDs have changed but no other updates were applied to the core user record.
-			_, err := tx.ExecContext(ctx, "UPDATE users SET update_time = now() WHERE id = $1", userID)
-			if err != nil {
-				logger.Error("Could not unlink device ID.", zap.Error(err), zap.Any("input", in))
-				return err
-			}
-		}
-
-		return nil
-	}); err != nil {
-		var se *statusError
-		if errors.As(err, &se) {
-			// Errors such as unlinking the last profile or username in use.
-			return nil, se.Status()
-		}
-		logger.Error("Error updating user.", zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to update the user.")
-	}
-
-	return &emptypb.Empty{}, nil
 }
 
 func (s *ConsoleServer) AddAccountNote(ctx context.Context, in *console.AddAccountNoteRequest) (*console.AccountNote, error) {
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	consoleUserID, ok := ctx.Value(ctxConsoleUserIdKey{}).(uuid.UUID)
 	if !ok {
 		return nil, status.Error(codes.FailedPrecondition, "Console user identifier not found in request context.")
@@ -948,44 +528,14 @@ func (s *ConsoleServer) AddAccountNote(ctx context.Context, in *console.AddAccou
 		in.Id = uuid.Must(uuid.NewV4()).String()
 	}
 
-	query := `
-WITH cte AS (
-  INSERT INTO users_notes (user_id, id, note, create_id, update_id)
-  VALUES ($1, $2, $3, $4, $4)
-  ON CONFLICT (id)
-  DO UPDATE SET note = $3, update_time = now(), update_id = $4
-  RETURNING create_time, update_time, create_id
-)
-SELECT c.create_time, c.update_time, c.create_id, cu.username
-FROM cte AS c
-LEFT JOIN console_user AS cu ON c.create_id = cu.id
-`
-	var createTime, updateTime pgtype.Timestamptz
-	var createId, createUsername sql.NullString
-	if err := s.db.QueryRowContext(ctx, query, userID, in.Id, in.Note, consoleUserID).Scan(&createTime, &updateTime, &createId, &createUsername); err != nil {
-		logger.Error("Could not add or update user note.", zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to add or update user note.")
+	noteID, err := uuid.FromString(in.Id)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Invalid note ID.")
 	}
+	in.Id = noteID.String()
 
-	note := &console.AccountNote{
-		Id:             in.Id,
-		UserId:         in.AccountId,
-		Note:           in.Note,
-		CreateTime:     timestamppb.New(createTime.Time),
-		UpdateTime:     timestamppb.New(updateTime.Time),
-		UpdateUsername: consoleUsername,
-	}
-	if createUsername.Valid {
-		note.CreateUsername = createUsername.String
-	}
-	if createId.Valid {
-		note.CreateId = createId.String
-	}
-	if consoleUserID != uuid.Nil {
-		note.UpdateId = consoleUserID.String()
-	}
+	return s.writeAccountNoteMySQL(ctx, userID, consoleUserID, consoleUsername, in)
 
-	return note, nil
 }
 
 func (s *ConsoleServer) ListAccountNotes(ctx context.Context, in *console.ListAccountNotesRequest) (*console.ListAccountNotesResponse, error) {
@@ -1018,18 +568,24 @@ func (s *ConsoleServer) ListAccountNotes(ctx context.Context, in *console.ListAc
 		}
 	}
 
-	query := `
-SELECT un.id, un.note, un.create_time, un.update_time, un.create_id, cuc.username, un.update_id, cuu.username
-FROM users_notes AS un
-LEFT JOIN console_user AS cuc ON un.create_id = cuc.id
-LEFT JOIN console_user AS cuu ON un.update_id = cuu.id
-WHERE user_id = $1`
+	query := ""
+
 	params := []interface{}{userID, in.Limit + 1}
 	if cursor != nil {
-		query += " AND (un.user_id, un.create_time, un.id) <= ($1, $3, $4)"
+
 		params = append(params, cursor.CreateTime, cursor.NoteID)
 	}
-	query += " ORDER BY un.create_time DESC, un.id DESC LIMIT $2"
+
+	{
+		query = "SELECT un.id,un.note,un.create_time,un.update_time,un.create_id,cuc.username,un.update_id,cuu.username FROM users_notes un LEFT JOIN console_user cuc ON un.create_id = cuc.id LEFT JOIN console_user cuu ON un.update_id = cuu.id WHERE user_id = ?"
+		params = []any{userID}
+		if cursor != nil {
+			query += " AND (un.create_time,un.id) <= (?,?)"
+			params = append(params, cursor.CreateTime, cursor.NoteID)
+		}
+		query += " ORDER BY un.create_time DESC, un.id DESC LIMIT ?"
+		params = append(params, in.Limit+1)
+	}
 
 	rows, err := s.db.QueryContext(ctx, query, params...)
 	if err != nil {
@@ -1042,7 +598,7 @@ WHERE user_id = $1`
 	notes := make([]*console.AccountNote, 0, in.Limit)
 	for rows.Next() {
 		note := &console.AccountNote{}
-		var createTime, updateTime pgtype.Timestamptz
+		var createTime, updateTime sql.NullTime
 		var createId, updateId, createUsername, updateUsername sql.NullString
 		if err := rows.Scan(&note.Id, &note.Note, &createTime, &updateTime, &createId, &createUsername, &updateId, &updateUsername); err != nil {
 			_ = rows.Close()
@@ -1093,11 +649,28 @@ WHERE user_id = $1`
 }
 
 func (s *ConsoleServer) DeleteAccountNote(ctx context.Context, in *console.DeleteAccountNoteRequest) (*emptypb.Empty, error) {
-	logger, _ := LoggerWithTraceId(ctx, s.logger)
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM users_notes WHERE id = $1", in.NoteId); err != nil {
-		logger.Error("Could not delete note.", zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to delete the user note.")
+	_, err := uuid.FromString(in.NoteId)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Invalid note ID.")
+	}
+	_, err = uuid.FromString(in.AccountId)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Invalid account ID.")
 	}
 
-	return &emptypb.Empty{}, nil
+	{
+		id, e := uuid.FromString(in.NoteId)
+		if e != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid note ID.")
+		}
+		owner, e := uuid.FromString(in.AccountId)
+		if e != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid account ID.")
+		}
+		if _, e = s.db.ExecContext(ctx, "DELETE FROM users_notes WHERE id = ? AND user_id = ?", id, owner); e != nil {
+			return nil, status.Error(codes.Internal, "Could not delete note.")
+		}
+		return &emptypb.Empty{}, nil
+	}
+
 }

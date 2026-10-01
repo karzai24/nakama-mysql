@@ -30,7 +30,7 @@ import (
 	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/heroiclabs/nakama/v3/console"
 	"github.com/heroiclabs/nakama/v3/console/acl"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
@@ -45,6 +45,7 @@ const (
 )
 
 type ConsoleTokenClaims struct {
+	Revision  int64  `json:"rev,omitempty"`
 	ID        string `json:"id,omitempty"`
 	Username  string `json:"usn,omitempty"`
 	Email     string `json:"ema,omitempty"`
@@ -103,6 +104,7 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 	var userId uuid.UUID
 	var mfaCode *wrapperspb.StringValue
 	var mfaRequired, mfaEnabled bool
+	var sessionRevision int64
 	transaction := func(tx *sql.Tx) error {
 		var mfaSecret, mfaRecoveryCodes []byte
 		switch in.Username {
@@ -125,19 +127,11 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 				}
 
 				// Create console root user to keep track of mfa configs.
-				query := `
-				WITH q AS (
-					INSERT INTO console_user (id, email, acl, username, password, mfa_required) VALUES ($1, $2, $3, $4, $5, $6)
-					ON CONFLICT (id) DO
-					UPDATE SET update_time = now(), acl = $3, username = $4, password = $5, mfa_required = $6
-					WHERE console_user.username <> $4 OR console_user.password <> $5 OR console_user.mfa_required <> $6
-					RETURNING mfa_secret, mfa_recovery_codes, mfa_required
-				)
-				(SELECT mfa_secret, mfa_recovery_codes, mfa_required FROM q)
-				UNION ALL
-				(SELECT mfa_secret, mfa_recovery_codes, mfa_required FROM console_user WHERE id = $1)
-				`
-				if err = tx.QueryRowContext(ctx, query, userId, "admin@nakama", aclJson, uname, hashedPassword, s.config.GetMFA().AdminAccountOn).Scan(&mfaSecret, &mfaRecoveryCodes, &mfaRequired); err != nil {
+				{
+					err = consoleRootMySQL(ctx, tx, uname, in.Password, hashedPassword, aclJson, s.config.GetMFA().AdminAccountOn, &mfaSecret, &mfaRecoveryCodes, &mfaRequired)
+				}
+
+				if err != nil {
 					logger.Error("failed to create admin console user", zap.Error(err))
 					return status.Error(codes.Internal, "Internal error")
 				}
@@ -154,7 +148,7 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 			}
 		default:
 			var err error
-			userId, uname, email, userAcl, mfaRequired, mfaSecret, mfaRecoveryCodes, err = s.lookupConsoleUser(ctx, logger, in.Username, in.Password, ip)
+			userId, uname, email, userAcl, mfaRequired, mfaSecret, mfaRecoveryCodes, err = s.lookupConsoleUser(ctx, logger, tx, in.Username, in.Password, ip)
 			if err != nil {
 				return err
 			}
@@ -222,7 +216,8 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 					return status.Error(codes.Internal, "Failed to decipher the MFA secret for the user.")
 				}
 
-				if _, err = tx.ExecContext(ctx, `UPDATE console_user SET mfa_recovery_codes = $1 WHERE id = $2`, updatedRecoveryCodes, userId); err != nil {
+				query := "UPDATE console_user SET mfa_recovery_codes = ? WHERE id = ?"
+				if _, err = tx.ExecContext(ctx, query, updatedRecoveryCodes, userId); err != nil {
 					if errors.Is(err, context.Canceled) {
 						return err
 					}
@@ -239,10 +234,20 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 				return status.Error(codes.Internal, "Failed to generate the MFA secret to re-configure the MFA mechanism.")
 			}
 
+			var revision int64
+			{
+				var updated time.Time
+				query := "SELECT update_time FROM console_user WHERE id = ?"
+				if err := tx.QueryRowContext(ctx, query, userId).Scan(&updated); err != nil {
+					return err
+				}
+				revision = updated.UnixMicro()
+			}
 			mfaToken, err := generateJWTToken(
 				consoleConfig.SigningKey,
 				&UserMFASetupToken{
 					UserID:      userId.String(),
+					Revision:    revision,
 					UserEmail:   email,
 					ExpiryTime:  tokenTime.Add(time.Duration(consoleConfig.TokenExpirySec) * time.Second).Unix(),
 					CreateTime:  tokenTime.Unix(),
@@ -257,6 +262,15 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 			}
 
 			mfaCode = &wrapperspb.StringValue{Value: mfaToken}
+		}
+
+		{
+			var updated time.Time
+			query := "SELECT update_time FROM console_user WHERE id = ?"
+			if err := tx.QueryRowContext(ctx, query, userId).Scan(&updated); err != nil {
+				return err
+			}
+			sessionRevision = updated.UnixMicro()
 		}
 
 		return nil
@@ -275,6 +289,7 @@ func (s *ConsoleServer) Authenticate(ctx context.Context, in *console.Authentica
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, &ConsoleTokenClaims{
 		ExpiresAt: exp,
+		Revision:  sessionRevision,
 		ID:        userId.String(),
 		Username:  uname,
 		Email:     email,
@@ -364,8 +379,17 @@ func (s *ConsoleServer) AuthenticateMFASetup(ctx context.Context, in *console.Au
 		return nil, status.Error(codes.Internal, "Failed to encrypt the MFA Recovery Codes.")
 	}
 
-	query := `UPDATE console_user SET mfa_secret = $1, mfa_recovery_codes = $2, update_time = now() WHERE id = $3 AND date_trunc('second', update_time) <= $4 RETURNING update_time`
-	_, err = s.db.ExecContext(ctx, query, dbMFASecret, dbRecoveryCodes, userId, time.Unix(claims.CreateTime, 0).UTC())
+	query := "UPDATE console_user SET mfa_secret = ?, mfa_recovery_codes = ?, update_time = GREATEST(CURRENT_TIMESTAMP(6), update_time + INTERVAL 1 MICROSECOND) WHERE id = ? AND mfa_secret IS NULL AND update_time = ?"
+	var res sql.Result
+	res, err = s.db.ExecContext(ctx, query, dbMFASecret, dbRecoveryCodes, userId, time.UnixMicro(claims.Revision).UTC())
+	if err == nil {
+		var count int64
+		count, err = res.RowsAffected()
+		if err == nil && count != 1 {
+			err = sql.ErrNoRows
+		}
+	}
+
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			logger.Warn("The token provided was created before the last update of the user data.")
@@ -376,6 +400,7 @@ func (s *ConsoleServer) AuthenticateMFASetup(ctx context.Context, in *console.Au
 		return nil, status.Errorf(codes.Internal, "Failed to update the user record with the new MFA secret and Recovery Codes.")
 	}
 
+	s.consoleSessionCache.RemoveAll(uuid.FromStringOrNil(userId))
 	return &console.AuthenticateMFASetupResponse{RecoveryCodes: recoveryCodes}, nil
 }
 
@@ -402,9 +427,14 @@ func (s *ConsoleServer) AuthenticatePasswordChange(ctx context.Context, in *cons
 		return nil, status.Error(codes.Internal, "Failed to hash the password for the user.")
 	}
 
-	query := `UPDATE console_user SET password = $1, update_time = NOW() WHERE id = $2 AND date_trunc('second', update_time) <= $3`
+	query := ""
 
-	res, err := s.db.ExecContext(ctx, query, hashedPassword, claims.Id, time.Unix(claims.IssuedAt, 0).UTC())
+	args := []any{hashedPassword, claims.Id, time.UnixMicro(claims.Revision).UTC()}
+	{
+		query = "UPDATE console_user SET password = ?, update_time = GREATEST(CURRENT_TIMESTAMP(6), update_time + INTERVAL 1 MICROSECOND) WHERE id = ? AND update_time = ?"
+		args[2] = time.UnixMicro(claims.Revision).UTC()
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		logger.Error("Failed to update the console user record with a new password.", zap.Error(err))
 		return nil, status.Errorf(codes.Internal, "Failed to update the console user record with a new password.")
@@ -421,16 +451,23 @@ func (s *ConsoleServer) AuthenticatePasswordChange(ctx context.Context, in *cons
 		return nil, status.Error(codes.Unauthenticated, "The token is outdated. Please ask your administrator for a new password reset.")
 	}
 
+	s.consoleSessionCache.RemoveAll(uuid.FromStringOrNil(claims.Id))
 	return &emptypb.Empty{}, nil
 }
 
-func (s *ConsoleServer) lookupConsoleUser(ctx context.Context, logger *zap.Logger, unameOrEmail, password, ip string) (id uuid.UUID, uname string, email string, role acl.Permission, mfaRequired bool, mfaSecret, mfaRecoveryCodes []byte, err error) {
+func (s *ConsoleServer) lookupConsoleUser(ctx context.Context, logger *zap.Logger, tx *sql.Tx, unameOrEmail, password, ip string) (id uuid.UUID, uname string, email string, role acl.Permission, mfaRequired bool, mfaSecret, mfaRecoveryCodes []byte, err error) {
 	role = acl.None()
 	var permissionBytes []byte
-	query := "SELECT id, username, email, acl, password, mfa_required, mfa_secret, mfa_recovery_codes, disable_time FROM console_user WHERE username = $1 OR email = $1"
+
 	var dbPassword []byte
-	var dbDisableTime pgtype.Timestamptz
-	err = s.db.QueryRowContext(ctx, query, unameOrEmail).Scan(&id, &uname, &email, &permissionBytes, &dbPassword, &mfaRequired, &mfaSecret, &mfaRecoveryCodes, &dbDisableTime)
+	var dbDisableTime sql.NullTime
+	var row Scannable
+	{
+		// Hold the user lock through recovery-code consumption and authentication.
+		row = tx.QueryRowContext(ctx, "SELECT id, username, email, acl, password, mfa_required, mfa_secret, mfa_recovery_codes, disable_time FROM console_user WHERE username = ? OR email = ? FOR UPDATE", unameOrEmail, unameOrEmail)
+	}
+
+	err = row.Scan(&id, &uname, &email, &permissionBytes, &dbPassword, &mfaRequired, &mfaSecret, &mfaRecoveryCodes, &dbDisableTime)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			if lockout, until := s.loginAttemptCache.Add("", ip); lockout == LockoutTypeIp {

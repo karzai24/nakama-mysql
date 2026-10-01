@@ -1,6 +1,10 @@
 # cloud.google.com/go/compute/metadata v0.9.0
 ## explicit; go 1.24.0
 cloud.google.com/go/compute/metadata
+# filippo.io/edwards25519 v1.1.0
+## explicit; go 1.20
+filippo.io/edwards25519
+filippo.io/edwards25519/field
 # github.com/RoaringBitmap/roaring v1.9.4
 ## explicit; go 1.14
 github.com/RoaringBitmap/roaring
@@ -100,6 +104,9 @@ github.com/felixge/httpsnoop
 ## explicit
 github.com/go-sourcemap/sourcemap
 github.com/go-sourcemap/sourcemap/internal/base64vlq
+# github.com/go-sql-driver/mysql v1.9.3
+## explicit; go 1.21.0
+github.com/go-sql-driver/mysql
 # github.com/gofrs/uuid/v5 v5.4.0
 ## explicit; go 1.19
 github.com/gofrs/uuid/v5
@@ -145,37 +152,6 @@ github.com/grpc-ecosystem/grpc-gateway/v2/utilities
 github.com/heroiclabs/nakama-common/api
 github.com/heroiclabs/nakama-common/rtapi
 github.com/heroiclabs/nakama-common/runtime
-# github.com/heroiclabs/sql-migrate v0.0.0-20241125131053-95a7949783b0
-## explicit; go 1.23.3
-github.com/heroiclabs/sql-migrate
-github.com/heroiclabs/sql-migrate/sqlparse
-# github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
-## explicit; go 1.12
-github.com/jackc/pgerrcode
-# github.com/jackc/pgpassfile v1.0.0
-## explicit; go 1.12
-github.com/jackc/pgpassfile
-# github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761
-## explicit; go 1.14
-github.com/jackc/pgservicefile
-# github.com/jackc/pgx/v5 v5.10.0
-## explicit; go 1.25.0
-github.com/jackc/pgx/v5
-github.com/jackc/pgx/v5/internal/iobufpool
-github.com/jackc/pgx/v5/internal/pgio
-github.com/jackc/pgx/v5/internal/sanitize
-github.com/jackc/pgx/v5/internal/stmtcache
-github.com/jackc/pgx/v5/pgconn
-github.com/jackc/pgx/v5/pgconn/ctxwatch
-github.com/jackc/pgx/v5/pgconn/internal/bgreader
-github.com/jackc/pgx/v5/pgproto3
-github.com/jackc/pgx/v5/pgtype
-github.com/jackc/pgx/v5/pgxpool
-github.com/jackc/pgx/v5/stdlib
-# github.com/jackc/puddle/v2 v2.2.2
-## explicit; go 1.19
-github.com/jackc/puddle/v2
-github.com/jackc/puddle/v2/internal/genstack
 # github.com/kamstrup/intmap v0.5.2
 ## explicit; go 1.23
 github.com/kamstrup/intmap
@@ -255,11 +231,11 @@ go.uber.org/zap/zaptest/observer
 # go.yaml.in/yaml/v3 v3.0.4
 ## explicit; go 1.16
 go.yaml.in/yaml/v3
-# golang.org/x/crypto v0.54.0
+# golang.org/x/crypto v0.55.0
 ## explicit; go 1.25.0
 golang.org/x/crypto/bcrypt
 golang.org/x/crypto/blowfish
-# golang.org/x/net v0.57.0
+# golang.org/x/net v0.58.0
 ## explicit; go 1.25.0
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
@@ -281,15 +257,12 @@ golang.org/x/oauth2/google/internal/stsexchange
 golang.org/x/oauth2/internal
 golang.org/x/oauth2/jws
 golang.org/x/oauth2/jwt
-# golang.org/x/sync v0.22.0
-## explicit; go 1.25.0
-golang.org/x/sync/semaphore
 # golang.org/x/sys v0.47.0
 ## explicit; go 1.25.0
 golang.org/x/sys/unix
 golang.org/x/sys/windows
 golang.org/x/sys/windows/registry
-# golang.org/x/text v0.40.0
+# golang.org/x/text v0.41.0
 ## explicit; go 1.25.0
 golang.org/x/text/cases
 golang.org/x/text/collate
@@ -299,14 +272,11 @@ golang.org/x/text/internal/language
 golang.org/x/text/internal/language/compact
 golang.org/x/text/internal/tag
 golang.org/x/text/language
-golang.org/x/text/runes
 golang.org/x/text/secure/bidirule
-golang.org/x/text/secure/precis
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
 golang.org/x/text/unicode/rangetable
-golang.org/x/text/width
 # google.golang.org/genproto/googleapis/api v0.0.0-20260706201446-f0a921348800
 ## explicit; go 1.25.0
 google.golang.org/genproto/googleapis/api
@@ -316,7 +286,7 @@ google.golang.org/genproto/googleapis/api/visibility
 # google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800
 ## explicit; go 1.25.0
 google.golang.org/genproto/googleapis/rpc/status
-# google.golang.org/grpc v1.82.0
+# google.golang.org/grpc v1.83.2
 ## explicit; go 1.25.0
 google.golang.org/grpc
 google.golang.org/grpc/attributes

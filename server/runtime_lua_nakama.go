@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL account lifecycle integration.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -5950,7 +5951,7 @@ func (n *RuntimeLuaNakamaModule) walletLedgerUpdate(l *lua.LState) int {
 	}
 
 	itemTable := l.CreateTable(0, 6)
-	itemTable.RawSetString("id", lua.LString(itemID))
+	itemTable.RawSetString("id", lua.LString(item.ID))
 	itemTable.RawSetString("user_id", lua.LString(item.UserID))
 	itemTable.RawSetString("create_time", lua.LNumber(item.CreateTime))
 	itemTable.RawSetString("update_time", lua.LNumber(item.UpdateTime))
@@ -5958,7 +5959,7 @@ func (n *RuntimeLuaNakamaModule) walletLedgerUpdate(l *lua.LState) int {
 	changesetTable := RuntimeLuaConvertMapInt64(l, item.Changeset)
 	itemTable.RawSetString("changeset", changesetTable)
 
-	itemTable.RawSetString("metadata", metadata)
+	itemTable.RawSetString("metadata", RuntimeLuaConvertMap(l, item.Metadata))
 
 	l.Push(itemTable)
 	return 1
@@ -5988,7 +5989,7 @@ func (n *RuntimeLuaNakamaModule) walletLedgerList(l *lua.LState) int {
 	// Parse limit.
 	limit := l.OptInt(2, 100)
 	if limit < 0 || limit > 100 {
-		l.ArgError(1, "expects limit to be 0-100")
+		l.ArgError(2, "expects limit to be 0-100")
 		return 0
 	}
 
@@ -10250,7 +10251,7 @@ func (n *RuntimeLuaNakamaModule) accountDeleteId(l *lua.LState) int {
 
 	recorded := l.OptBool(2, false)
 
-	if err := DeleteAccount(l.Context(), n.logger, n.db, n.config, n.leaderboardCache, n.rankCache, n.sessionRegistry, n.sessionCache, n.tracker, userID, recorded); err != nil {
+	if err := DeleteAccount(l.Context(), n.logger, n.db, n.config, n.leaderboardCache, n.rankCache, n.sessionRegistry, n.sessionCache, n.tracker, userID, recorded, n.storageIndex); err != nil {
 		l.RaiseError("error while trying to delete account: %v", err.Error())
 	}
 
@@ -10314,7 +10315,7 @@ func (n *RuntimeLuaNakamaModule) accountImportId(l *lua.LState) int {
 		}
 	}
 
-	account, err := ImportAccount(l.Context(), n.logger, n.db, n.statusRegistry, uid, d)
+	account, err := ImportAccount(l.Context(), n.logger, n.db, n.statusRegistry, uid, d, n.storageIndex)
 	if err != nil {
 		l.RaiseError("error importing account: %v", err.Error())
 		return 0

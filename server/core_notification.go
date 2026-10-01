@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL queries.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,14 +27,14 @@ import (
 	"time"
 
 	"github.com/heroiclabs/nakama-common/runtime"
-	"github.com/jackc/pgx/v5"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -136,11 +137,14 @@ func NotificationSendAll(ctx context.Context, logger *zap.Logger, db *sql.DB, tr
 			params := make([]interface{}, 0, 1)
 			query := "SELECT id FROM users"
 			if userIDStr != "" {
-				query += " WHERE id > $1"
+				query += " WHERE id > ?"
 				params = append(params, userIDStr)
 			}
 			query += fmt.Sprintf(" ORDER BY id ASC LIMIT %d", limit)
 
+			if userIDStr != "" {
+				query = fmt.Sprintf("SELECT id FROM users WHERE id > ? ORDER BY id ASC LIMIT %d", limit)
+			}
 			rows, err := db.QueryContext(ctx, query, params...)
 			if err != nil {
 				notificationLogger.Error("Failed to retrieve user data to send notification", zap.Error(err))
@@ -219,26 +223,17 @@ func NotificationList(ctx context.Context, logger *zap.Logger, db *sql.DB, userI
 		}
 	}
 
-	params := []interface{}{userID}
-
-	limitQuery := ""
-	if limit > 0 {
-		params = append(params, limit+1)
-		limitQuery = " LIMIT $2"
-	}
-
-	cursorQuery := ""
+	query := "SELECT id, subject, content, code, sender_id, create_time FROM notification WHERE user_id = ?"
+	params := []any{userID.String()}
 	if nc != nil && nc.NotificationID != nil {
-		cursorQuery = " AND (user_id, create_time, id) > ($1::UUID, $3::TIMESTAMPTZ, $4::UUID)"
-		params = append(params, &pgtype.Timestamptz{Time: time.Unix(0, nc.CreateTime).UTC(), Valid: true}, uuid.FromBytesOrNil(nc.NotificationID))
+		query += " AND (create_time, id) > (?, ?)"
+		params = append(params, time.Unix(0, nc.CreateTime).UTC(), uuid.FromBytesOrNil(nc.NotificationID).String())
 	}
-
-	query := `
-SELECT id, subject, content, code, sender_id, create_time
-FROM notification
-WHERE user_id = $1` + cursorQuery + `
-ORDER BY create_time ASC, id ASC` + limitQuery
-
+	query += " ORDER BY create_time, id"
+	if limit > 0 {
+		query += " LIMIT ?"
+		params = append(params, limit+1)
+	}
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Could not retrieve notifications.", zap.Error(err))
@@ -256,7 +251,7 @@ ORDER BY create_time ASC, id ASC` + limitQuery
 			break
 		}
 		no := &api.Notification{Persistent: true, CreateTime: &timestamppb.Timestamp{}}
-		var createTime pgtype.Timestamptz
+		var createTime sql.NullTime
 		if err := rows.Scan(&no.Id, &no.Subject, &no.Content, &no.Code, &no.SenderId, &createTime); err != nil {
 			_ = rows.Close()
 			logger.Error("Could not scan notification from database.", zap.Error(err))
@@ -308,54 +303,15 @@ ORDER BY create_time ASC, id ASC` + limitQuery
 }
 
 func NotificationDelete(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, notificationIDs []string) error {
-	params := []any{userID, notificationIDs}
 
-	query := "DELETE FROM notification WHERE user_id = $1 AND id = ANY($2)"
-	logger.Debug("Delete notification query", zap.String("query", query), zap.Any("params", params))
-	_, err := db.ExecContext(ctx, query, params...)
-	if err != nil {
-		logger.Error("Could not delete notifications.", zap.Error(err))
-		return err
-	}
+	return notificationsDeleteMySQL(ctx, db, userID.String(), notificationIDs)
 
-	return nil
 }
 
 func NotificationSave(ctx context.Context, logger *zap.Logger, db *sql.DB, notifications map[uuid.UUID][]*api.Notification) error {
-	ids := make([]string, 0, len(notifications))
-	userIds := make([]uuid.UUID, 0, len(notifications))
-	subjects := make([]string, 0, len(notifications))
-	contents := make([]string, 0, len(notifications))
-	codes := make([]int32, 0, len(notifications))
-	senderIds := make([]string, 0, len(notifications))
-	query := `
-INSERT INTO
-	notification (id, user_id, subject, content, code, sender_id)
-SELECT
-	unnest($1::uuid[]),
-	unnest($2::uuid[]),
-	unnest($3::text[]),
-	unnest($4::jsonb[]),
-	unnest($5::smallint[]),
-	unnest($6::uuid[]);
-`
-	for userID, no := range notifications {
-		for _, un := range no {
-			ids = append(ids, un.Id)
-			userIds = append(userIds, userID)
-			subjects = append(subjects, un.Subject)
-			contents = append(contents, un.Content)
-			codes = append(codes, un.Code)
-			senderIds = append(senderIds, un.SenderId)
-		}
-	}
 
-	if _, err := db.ExecContext(ctx, query, ids, userIds, subjects, contents, codes, senderIds); err != nil {
-		logger.Error("Could not save notifications.", zap.Error(err))
-		return err
-	}
+	return notificationsSaveMySQL(ctx, db, notifications)
 
-	return nil
 }
 
 func NotificationsGetId(ctx context.Context, logger *zap.Logger, db *sql.DB, userID string, ids ...string) ([]*runtime.Notification, error) {
@@ -370,12 +326,23 @@ func NotificationsGetId(ctx context.Context, logger *zap.Logger, db *sql.DB, use
 	}
 
 	params := []any{ids}
-	query := "SELECT id, user_id, subject, content, code, sender_id, create_time FROM notification WHERE id = any($1)"
+	query := ""
 	if userID != "" {
-		query += " AND user_id = $2"
+
 		params = append(params, userID)
 	}
 
+	{
+		query = "SELECT id, user_id, subject, content, code, sender_id, create_time FROM notification WHERE id IN (" + mysqlPlaceholders(len(ids)) + ")"
+		params = make([]any, 0, len(ids)+1)
+		for _, id := range ids {
+			params = append(params, id)
+		}
+		if userID != "" {
+			query += " AND user_id = ?"
+			params = append(params, userID)
+		}
+	}
 	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("failed to list notifications by id", zap.Error(err))
@@ -387,7 +354,7 @@ func NotificationsGetId(ctx context.Context, logger *zap.Logger, db *sql.DB, use
 	notifications := make([]*runtime.Notification, 0, len(ids))
 	for rows.Next() {
 		no := &runtime.Notification{Persistent: true, CreateTime: &timestamppb.Timestamp{}}
-		var createTime pgtype.Timestamptz
+		var createTime sql.NullTime
 		var content string
 		if err := rows.Scan(&no.Id, &no.UserID, &no.Subject, &content, &no.Code, &no.Sender, &createTime); err != nil {
 			_ = rows.Close()
@@ -433,12 +400,8 @@ func NotificationsDeleteId(ctx context.Context, logger *zap.Logger, db *sql.DB, 
 		return NotificationDelete(ctx, logger, db, uid, ids)
 	}
 
-	if _, err := db.ExecContext(ctx, "DELETE FROM notification WHERE id = any($1)", ids); err != nil {
-		logger.Error("failed to delete notifications by id", zap.Error(err))
-		return fmt.Errorf("failed to delete notifications: %s", err.Error())
-	}
+	return notificationsDeleteMySQL(ctx, db, "", ids)
 
-	return nil
 }
 
 type notificationUpdate struct {
@@ -449,29 +412,7 @@ type notificationUpdate struct {
 }
 
 func NotificationsUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, updates ...notificationUpdate) error {
-	if len(updates) == 0 {
-		// NOOP
-		return nil
-	}
 
-	b := &pgx.Batch{}
-	for _, update := range updates {
-		b.Queue("UPDATE notification SET content = coalesce($1, content), subject = coalesce($2, subject), sender_id = coalesce($3, sender_id) WHERE id = $4", update.Content, update.Subject, update.Sender, update.Id)
-	}
+	return notificationsUpdateMySQL(ctx, db, updates)
 
-	if err := ExecuteInTxPgx(ctx, db, func(tx pgx.Tx) error {
-		r := tx.SendBatch(ctx, b)
-		_, err := r.Exec()
-		defer r.Close()
-		if err != nil {
-			return err
-		}
-
-		return nil
-	}); err != nil {
-		logger.Error("failed to update notifications", zap.Error(err))
-		return fmt.Errorf("failed to update notifications: %s", err.Error())
-	}
-
-	return nil
 }

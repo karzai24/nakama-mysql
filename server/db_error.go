@@ -18,13 +18,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgerrcode"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-)
-
-const (
-	dbErrorUniqueViolation = pgerrcode.UniqueViolation
 )
 
 var ErrRowsAffectedCount = errors.New("rows_affected_count")

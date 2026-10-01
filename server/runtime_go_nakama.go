@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL account lifecycle integration.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -546,7 +547,7 @@ func (n *RuntimeGoNakamaModule) AccountDeleteId(ctx context.Context, userID stri
 		return errors.New("expects user ID to be a valid identifier")
 	}
 
-	return DeleteAccount(ctx, n.logger, n.db, n.config, n.leaderboardCache, n.leaderboardRankCache, n.sessionRegistry, n.sessionCache, n.tracker, u, recorded)
+	return DeleteAccount(ctx, n.logger, n.db, n.config, n.leaderboardCache, n.leaderboardRankCache, n.sessionRegistry, n.sessionCache, n.tracker, u, recorded, n.storageIndex)
 }
 
 // @group accounts
@@ -599,7 +600,7 @@ func (n *RuntimeGoNakamaModule) AccountImportId(ctx context.Context, data, userI
 		}
 	}
 
-	account, err := ImportAccount(ctx, n.logger, n.db, n.statusRegistry, u, d)
+	account, err := ImportAccount(ctx, n.logger, n.db, n.statusRegistry, u, d, n.storageIndex)
 	if err != nil {
 		return nil, fmt.Errorf("error importing account: %v", err.Error())
 	}

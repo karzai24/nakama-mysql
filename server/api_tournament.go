@@ -66,9 +66,9 @@ func (s *ApiServer) DeleteTournamentRecord(ctx context.Context, in *api.DeleteTo
 
 	if err := TournamentRecordDelete(ctx, logger, s.db, s.leaderboardCache, s.leaderboardRankCache, userID, in.TournamentId, userID.String()); err != nil {
 		switch err {
-		case ErrLeaderboardNotFound:
+		case ErrLeaderboardNotFound, runtime.ErrTournamentNotFound:
 			return nil, status.Error(codes.NotFound, "Tournament not found.")
-		case ErrLeaderboardAuthoritative:
+		case ErrLeaderboardAuthoritative, runtime.ErrTournamentAuthoritative:
 			return nil, status.Error(codes.PermissionDenied, "Tournament only allows authoritative score deletions.")
 		default:
 			return nil, status.Error(codes.Internal, "Error deleting score from tournament.")

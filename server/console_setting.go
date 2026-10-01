@@ -23,7 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -39,10 +39,10 @@ func (s *ConsoleServer) GetSetting(ctx context.Context, in *console.SettingReque
 		return nil, ErrSettingInvalid
 	}
 
-	query := `SELECT name, value, update_time FROM setting WHERE name = $1`
+	query := "SELECT name, value, update_time FROM setting WHERE name = ?"
 
 	var name, value string
-	var updateTime pgtype.Timestamptz
+	var updateTime sql.NullTime
 
 	if err := s.db.QueryRowContext(ctx, query, in.Name).Scan(&name, &value, &updateTime); err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -70,12 +70,19 @@ func (s *ConsoleServer) UpdateSetting(ctx context.Context, in *console.UpdateSet
 		return nil, ErrSettingInvalid
 	}
 
-	var updateTime pgtype.Timestamptz
+	var updateTime sql.NullTime
 
-	query := "UPDATE setting SET value = $2, update_time = now() WHERE name = $1 RETURNING update_time"
-	params := []any{in.Name, in.Value}
+	var err error
+	{
+		err = executeInTxMySQL(ctx, s.db, func(tx *sql.Tx) error {
+			if _, e := tx.ExecContext(ctx, "UPDATE setting SET value = ?, update_time = CURRENT_TIMESTAMP(6) WHERE name = ?", in.Value, in.Name); e != nil {
+				return e
+			}
+			return tx.QueryRowContext(ctx, "SELECT update_time FROM setting WHERE name = ?", in.Name).Scan(&updateTime)
+		})
+	}
 
-	if err := s.db.QueryRowContext(ctx, query, params...).Scan(&updateTime); err != nil {
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil, status.Error(codes.Canceled, "Request was canceled.")
 		}
@@ -98,11 +105,12 @@ func (s *ConsoleServer) ListSettings(ctx context.Context, in *console.ListSettin
 	params := []any{}
 
 	if len(in.Names) > 0 {
-		query += " WHERE name = ANY($1::text[])"
-
-		params = append(params, in.Names)
+		query = "SELECT name, value, update_time FROM setting WHERE name IN (" + mysqlMarks(len(in.Names)) + ")"
+		params = nil
+		for _, name := range in.Names {
+			params = append(params, name)
+		}
 	}
-
 	rows, err := s.db.QueryContext(ctx, query, params...)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -118,7 +126,7 @@ func (s *ConsoleServer) ListSettings(ctx context.Context, in *console.ListSettin
 	for rows.Next() {
 		var name, value string
 
-		var updateTime pgtype.Timestamptz
+		var updateTime sql.NullTime
 		if err := rows.Scan(&name, &value, &updateTime); err != nil {
 			return nil, status.Error(codes.Internal, "An error occurred while trying to read settings.")
 		}

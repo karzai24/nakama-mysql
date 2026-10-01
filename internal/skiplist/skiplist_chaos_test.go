@@ -3,9 +3,10 @@ package skiplist
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"sort"
+	"strconv"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -41,7 +42,15 @@ func TestSkiplistChaos(t *testing.T) {
 	t.Parallel()
 	iterations := 20
 
-	seed := time.Now().UnixNano()
+	// Stable by default so every backend checks the same workload. Override with
+	// a recorded integer seed for additional stress runs and exact replay.
+	seed := int64(1)
+	if value := os.Getenv("SKIPLIST_CHAOS_SEED"); value != "" {
+		var err error
+		seed, err = strconv.ParseInt(value, 10, 64)
+		require.NoError(t, err, "SKIPLIST_CHAOS_SEED must be an int64")
+	}
+	t.Logf("skiplist chaos seed=%d iterations=%d", seed, iterations)
 
 	rndMain := rand.New(rand.NewSource(seed))
 
