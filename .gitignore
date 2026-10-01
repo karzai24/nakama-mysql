@@ -726,3 +726,6 @@ __pycache__/
 
 # Disposable parity run evidence (may include synthetic credentials).
 .parity-results/
+
+# Vendored source names must not be treated as coverage reports.
+!vendor/**/coverage.go
