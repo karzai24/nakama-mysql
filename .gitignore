@@ -716,3 +716,16 @@ MigrationBackup/
 .ionide/
 
 # End of https://www.toptal.com/developers/gitignore/api/go,angular,node,intellij+all,visualstudiocode,visualstudio,sublimetext,windows,linux,macos
+
+# Modified for the private MySQL fork: local development credentials.
+.env
+.env.*
+
+# Local Python development tooling.
+__pycache__/
+
+# Disposable parity run evidence (may include synthetic credentials).
+.parity-results/
+
+# Vendored source names must not be treated as coverage reports.
+!vendor/**/coverage.go

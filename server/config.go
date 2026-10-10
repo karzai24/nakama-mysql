@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL backend dispatch.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +19,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"gopkg.in/yaml.v3"
 	"maps"
 	"net/url"
 	"os"
@@ -31,7 +33,6 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"gopkg.in/yaml.v3"
 )
 
 // Config interface is the Nakama core configuration.
@@ -430,17 +431,14 @@ func ValidateConfig(logger *zap.Logger, c Config) map[string]string {
 }
 
 func ValidateConfigDatabase(logger *zap.Logger, c Config) {
-	if len(c.GetDatabase().Addresses) < 1 {
-		logger.Fatal("At least one database address must be specified", zap.Strings("database.address", c.GetDatabase().Addresses))
+	if c.GetDatabase().Backend != "mysql" {
+		logger.Fatal("This release supports only database.backend=mysql")
 	}
-	for _, address := range c.GetDatabase().Addresses {
-		rawURL := fmt.Sprintf("postgresql://%s", address)
-		if _, err := url.Parse(rawURL); err != nil {
-			logger.Fatal("Bad database connection URL", zap.String("database.address", address), zap.Error(err))
-		}
+	if _, err := DbMySQLConfig(c); err != nil {
+		logger.Fatal("Bad MySQL configuration", zap.Error(err))
 	}
-	if c.GetDatabase().DnsScanIntervalSec < 1 {
-		logger.Fatal("Database DNS scan interval seconds must be > 0", zap.Int("database.dns_scan_interval_sec", c.GetDatabase().DnsScanIntervalSec))
+	if c.GetDatabase().ConnMaxLifetimeMs <= 0 || c.GetDatabase().MaxOpenConns <= 0 || c.GetDatabase().MaxIdleConns < 0 {
+		logger.Fatal("MySQL requires positive connection lifetime and pool size, and nonnegative idle count")
 	}
 }
 
@@ -921,7 +919,8 @@ func NewSocketConfig() *SocketConfig {
 
 // DatabaseConfig is configuration relevant to the Database storage.
 type DatabaseConfig struct {
-	Addresses          []string `yaml:"address" json:"address" usage:"List of database servers (username:password@address:port/dbname). Default 'root@localhost:26257'."`
+	Backend            string   `yaml:"backend" json:"backend" usage:"Database backend: mysql only."`
+	Addresses          []string `yaml:"address" json:"address" usage:"List of database servers (username:password@address:port/dbname). Default 'nakama@localhost:3306/nakama'; verified TLS by default."`
 	ConnMaxLifetimeMs  int      `yaml:"conn_max_lifetime_ms" json:"conn_max_lifetime_ms" usage:"Time in milliseconds to reuse a database connection before the connection is killed and a new one is created. Default 3600000 (1 hour)."`
 	MaxOpenConns       int      `yaml:"max_open_conns" json:"max_open_conns" usage:"Maximum number of allowed open connections to the database. Default 100."`
 	MaxIdleConns       int      `yaml:"max_idle_conns" json:"max_idle_conns" usage:"Maximum number of allowed open but unused connections to the database. Default 100."`
@@ -945,7 +944,8 @@ func (cfg *DatabaseConfig) Clone() *DatabaseConfig {
 
 func NewDatabaseConfig() *DatabaseConfig {
 	return &DatabaseConfig{
-		Addresses:          []string{"root@localhost:26257"},
+		Backend:            "mysql",
+		Addresses:          []string{"nakama@localhost:3306/nakama"},
 		ConnMaxLifetimeMs:  3600000,
 		MaxOpenConns:       100,
 		MaxIdleConns:       100,

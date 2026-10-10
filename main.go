@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL backend dispatch.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,8 +35,6 @@ import (
 	"github.com/heroiclabs/nakama/v3/se"
 	"github.com/heroiclabs/nakama/v3/server"
 	"github.com/heroiclabs/nakama/v3/social"
-	"github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/jackc/pgx/v5/stdlib" // Blank import to register SQL driver
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -88,22 +87,13 @@ func main() {
 			server.ValidateConfigDatabase(tmpLogger, config)
 			db := server.DbConnect(ctx, tmpLogger, config, true)
 			defer db.Close()
-
-			conn, err := db.Conn(ctx)
-			if err != nil {
-				tmpLogger.Fatal("Failed to acquire db conn for migration", zap.Error(err))
+			cmd := ""
+			if len(os.Args) > 2 {
+				cmd = os.Args[2]
 			}
-
-			if err = conn.Raw(func(driverConn any) error {
-				pgxConn := driverConn.(*stdlib.Conn).Conn()
-				migrate.RunCmd(ctx, tmpLogger, pgxConn, os.Args[2], config.GetLimit(), config.GetLogger().Format)
-
-				return nil
-			}); err != nil {
-				conn.Close()
-				tmpLogger.Fatal("Failed to acquire pgx conn for migration", zap.Error(err))
+			if err := migrate.RunMySQL(ctx, tmpLogger, db, cmd, config.GetLimit()); err != nil {
+				tmpLogger.Fatal("MySQL migration failed", zap.Error(err))
 			}
-			conn.Close()
 			return
 		case "check":
 			// Parse any command line args to look up runtime path.
@@ -147,32 +137,28 @@ func main() {
 
 	redactedAddresses := make([]string, 0, 1)
 	for _, address := range config.GetDatabase().Addresses {
-		rawURL := fmt.Sprintf("postgres://%s", address)
+		rawURL := address
+		if !strings.Contains(rawURL, "://") {
+			scheme := "mysql"
+			if config.GetDatabase().Backend == "mysql" {
+				scheme = "mysql"
+			}
+			rawURL = scheme + "://" + rawURL
+		}
 		parsedURL, err := url.Parse(rawURL)
 		if err != nil {
-			logger.Fatal("Bad connection URL", zap.Error(err))
+			logger.Fatal("Bad connection URL")
 		}
-		redactedAddresses = append(redactedAddresses, strings.TrimPrefix(parsedURL.Redacted(), "postgres://"))
+		redactedAddresses = append(redactedAddresses, parsedURL.Redacted())
 	}
 	startupLogger.Info("Database connections", zap.Strings("dsns", redactedAddresses))
 
 	db := server.DbConnect(ctx, startupLogger, config, false)
 
 	// Check migration status and fail fast if the schema has diverged.
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		logger.Fatal("Failed to acquire db conn for migration check", zap.Error(err))
+	if err := migrate.CheckMySQL(ctx, db); err != nil {
+		logger.Fatal("MySQL schema check failed", zap.Error(err))
 	}
-
-	if err = conn.Raw(func(driverConn any) error {
-		pgxConn := driverConn.(*stdlib.Conn).Conn()
-		migrate.Check(ctx, startupLogger, pgxConn)
-		return nil
-	}); err != nil {
-		conn.Close()
-		logger.Fatal("Failed to acquire pgx conn for migration check", zap.Error(err))
-	}
-	conn.Close()
 
 	// Access to social provider integrations.
 	socialClient := social.NewClient(logger, 5*time.Second, config.GetGoogleAuth().OAuthConfig, config.GetGoogleAuth().ClientIDs...)
@@ -180,7 +166,7 @@ func main() {
 	// Start up server components.
 	metrics := server.NewLocalMetrics(logger, startupLogger, db, config)
 	sessionRegistry := server.NewLocalSessionRegistry(metrics)
-	sessionCache := server.NewLocalSessionCache(config.GetSession().TokenExpirySec, config.GetSession().RefreshTokenExpirySec)
+	var sessionCache server.SessionCache = server.NewLocalSessionCache(config.GetSession().TokenExpirySec, config.GetSession().RefreshTokenExpirySec)
 	consoleSessionCache := server.NewLocalSessionCache(config.GetConsole().TokenExpirySec, 0)
 	loginAttemptCache := server.NewLocalLoginAttemptCache()
 	statusRegistry := server.NewLocalStatusRegistry(logger, config, sessionRegistry, jsonpbMarshaler)

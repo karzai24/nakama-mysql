@@ -281,7 +281,6 @@ func TestPCall(t *testing.T) {
 	defer L.Close()
 	L.Register("f1", func(L *LState) int {
 		panic("panic!")
-		return 0
 	})
 	errorIfScriptNotFail(t, L, `f1()`, "panic!")
 	L.Push(L.GetGlobal("f1"))
@@ -299,7 +298,6 @@ func TestPCall(t *testing.T) {
 
 	err = L.PCall(0, 0, L.NewFunction(func(L *LState) int {
 		panic("panicc!")
-		return 1
 	}))
 	errorIfFalse(t, strings.Contains(err.Error(), "panicc!"), "")
 }
@@ -488,7 +486,7 @@ func TestRegistryFixedOverflow(t *testing.T) {
 		rcv := recover()
 		if rcv != nil {
 			if expectedPanic {
-				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got "+rcv.(error).Error())
+				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got %s", rcv.(error).Error())
 			} else {
 				t.Errorf("did not expect registry overflow")
 			}
@@ -508,7 +506,7 @@ func TestRegistryAutoGrow(t *testing.T) {
 		rcv := recover()
 		if rcv != nil {
 			if expectedPanic {
-				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got "+rcv.(error).Error())
+				errorIfFalse(t, rcv.(error).Error() != "registry overflow", "expected registry overflow exception, got %s", rcv.(error).Error())
 			} else {
 				t.Errorf("did not expect registry overflow")
 			}
@@ -736,5 +734,20 @@ func BenchmarkRegistrySetTop(t *testing.B) {
 	for j := 0; j < t.N; j++ {
 		reg.SetTop(sz)
 		reg.SetTop(0)
+	}
+}
+
+// Formatting directives in Lua errors are user text, never a Go format string.
+func TestErrorMessagePreservesPercentLiterals(t *testing.T) {
+	for _, script := range []string{
+		`error("literal %s %! 100%", 0)`,
+		`assert(false, "literal %s %! 100%")`,
+	} {
+		L := NewState()
+		err := L.DoString(script)
+		L.Close()
+		if err == nil || !strings.Contains(err.Error(), "literal %s %! 100%") {
+			t.Fatalf("error text was changed: %v", err)
+		}
 	}
 }

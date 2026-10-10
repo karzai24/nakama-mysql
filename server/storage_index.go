@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL queries.
 // Copyright 2023 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -462,28 +463,28 @@ func (si *LocalStorageIndex) Load(ctx context.Context) error {
 }
 
 func (si *LocalStorageIndex) load(ctx context.Context, idx *storageIndex) error {
-	query := `
-SELECT user_id, key, version, value, read, write, create_time, update_time
-FROM storage
-WHERE collection = $1
-ORDER BY collection, key, user_id
-LIMIT $2`
-	params := []any{idx.Collection, 10_000}
-
-	if idx.Key != "" {
-		query = `
-SELECT user_id, key, version, value, read, write, create_time, update_time
-FROM storage
-WHERE collection = $1 AND key = $3
-ORDER BY collection, key, user_id
-LIMIT $2`
-		params = append(params, idx.Key)
-	}
+	var query string
+	var params []any
 
 	filterFn := si.customFilterFunctions[idx.Name]
 
 	var count int
+	var mysqlLastKey string
+	var mysqlLastOwner *uuid.UUID
 	for {
+		{
+			query = "SELECT user_id, `key`, version, value, `read`, `write`, create_time, update_time FROM storage WHERE collection = ?"
+			params = []any{idx.Collection}
+			if idx.Key != "" {
+				query += " AND `key` = ?"
+				params = append(params, idx.Key)
+			}
+			if mysqlLastOwner != nil {
+				query += " AND (`key`, user_id) > (?, ?)"
+				params = append(params, mysqlLastKey, mysqlLastOwner.String())
+			}
+			query += " ORDER BY `key`, user_id LIMIT 10000"
+		}
 		rows, err := si.db.QueryContext(ctx, query, params...)
 		if err != nil {
 			return err
@@ -555,24 +556,7 @@ LIMIT $2`
 			break
 		}
 
-		query = `
-SELECT user_id, key, version, value, read, write, create_time, update_time
-FROM storage
-WHERE collection = $1
-AND (collection, key, user_id) > ($1, $3, $4)
-ORDER BY collection, key, user_id
-LIMIT $2`
-		if idx.Key != "" {
-			query = `
-SELECT user_id, key, version, value, read, write, create_time, update_time
-FROM storage
-WHERE collection = $1
-AND key = $3
-AND user_id > $4
-ORDER BY collection, key, user_id
-LIMIT $2`
-		}
-		params = []any{idx.Collection, 10_000, dbKey, dbUserID}
+		mysqlLastKey, mysqlLastOwner = dbKey, dbUserID
 	}
 
 	return nil

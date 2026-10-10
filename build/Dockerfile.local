@@ -31,12 +31,12 @@ RUN go build -o /go/build-out/nakama -trimpath -mod=vendor -gcflags "-trimpath $
 
 FROM debian:bookworm-slim
 
-LABEL MAINTAINER="Heroic Labs <support@heroiclabs.com>"
+LABEL maintainer="nakama-mysql contributors"
 
 ARG version
 
 LABEL version=$version
-LABEL variant=nakama
+LABEL variant=nakama-mysql
 LABEL description="Distributed server for social and realtime games and apps."
 
 RUN mkdir -p /nakama/data/modules && \

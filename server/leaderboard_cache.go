@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL backend dispatch.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,20 +19,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"log"
 	"math"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
-
 	"github.com/heroiclabs/nakama/v3/internal/cronexpr"
-	"github.com/jackc/pgx/v5/pgtype"
+
 	"go.uber.org/zap"
 )
 
@@ -204,21 +201,23 @@ func (l *LocalLeaderboardCache) RefreshAllLeaderboards(ctx context.Context) erro
 
 	const limit = 10_000
 
-	var createTime pgtype.Timestamptz
+	var createTime sql.NullTime
 	var id string
 	for {
-		query := `
-SELECT id, authoritative, sort_order, operator, reset_schedule, metadata, create_time,
-category, description, duration, end_time, join_required, max_size, max_num_score, title, start_time, enable_ranks
-FROM leaderboard`
-		params := make([]any, 0, 3)
-		params = append(params, limit)
-		if id != "" {
-			query += " WHERE (create_time, id) > ($2, $3)"
-			params = append(params, createTime, id)
-		}
-		query += " ORDER BY create_time ASC, id ASC LIMIT $1"
+		var query string
+		var params []interface{}
 
+		{
+			query = `SELECT id, authoritative, sort_order, operator, reset_schedule, metadata, create_time,
+                category, description, duration, end_time, join_required, max_size, max_num_score, title, start_time, enable_ranks FROM leaderboard`
+			params = nil
+			if id != "" {
+				query += " WHERE (create_time, id) > (?, ?)"
+				params = append(params, createTime.Time, id)
+			}
+			query += " ORDER BY create_time ASC, id ASC LIMIT ?"
+			params = append(params, limit)
+		}
 		rows, err := l.db.QueryContext(ctx, query, params...)
 		if err != nil {
 			l.logger.Error("Error loading leaderboard cache from database", zap.Error(err))
@@ -235,12 +234,12 @@ FROM leaderboard`
 			var category int
 			var description string
 			var duration int
-			var endTime pgtype.Timestamptz
+			var endTime sql.NullTime
 			var joinRequired bool
 			var maxSize int
 			var maxNumScore int
 			var title string
-			var startTime pgtype.Timestamptz
+			var startTime sql.NullTime
 			var enableRanks bool
 
 			err = rows.Scan(&id, &authoritative, &sortOrder, &operator, &resetSchedule, &metadata, &createTime,
@@ -374,78 +373,22 @@ func (l *LocalLeaderboardCache) Create(ctx context.Context, id string, authorita
 	}
 	l.RUnlock()
 
-	var expr *cronexpr.Expression
 	var err error
 	if resetSchedule != "" {
-		expr, err = cronexpr.Parse(resetSchedule)
+		_, err = cronexpr.Parse(resetSchedule)
 		if err != nil {
 			l.logger.Error("Error parsing leaderboard reset schedule", zap.Error(err))
 			return nil, false, err
 		}
 	}
 
-	// Insert into database first.
-	query := "INSERT INTO leaderboard (id, authoritative, sort_order, operator, metadata, enable_ranks"
-	if resetSchedule != "" {
-		query += ", reset_schedule"
+	if metadata == "" {
+		metadata = "{}"
 	}
-	query += ") VALUES ($1, $2, $3, $4, $5, $6"
-	if resetSchedule != "" {
-		query += ", $7"
-	}
-	query += ") RETURNING create_time"
-	params := []any{id, authoritative, sortOrder, operator, metadata, enableRanks}
-	if resetSchedule != "" {
-		params = append(params, resetSchedule)
-	}
-	var createTime pgtype.Timestamptz
-	err = l.db.QueryRowContext(ctx, query, params...).Scan(&createTime)
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
-			// Concurrent attempt at creating the leaderboard, to keep idempotency query the existing leaderboard data.
-			if err = l.db.QueryRowContext(ctx, "SELECT authoritative, sort_order, operator, COALESCE(reset_schedule, ''), metadata, create_time FROM leaderboard WHERE id = $1", id).Scan(&authoritative, &sortOrder, &operator, &resetSchedule, &metadata, &createTime); err != nil {
-				l.logger.Error("Error retrieving leaderboard", zap.Error(err))
-				return nil, false, err
-			}
-			if resetSchedule != "" {
-				expr, err = cronexpr.Parse(resetSchedule)
-				if err != nil {
-					l.logger.Error("Error parsing leaderboard reset schedule", zap.Error(err))
-					return nil, false, err
-				}
-			}
-		} else {
-			l.logger.Error("Error creating leaderboard", zap.Error(err))
-			return nil, false, err
-		}
-	}
+	requested := &Leaderboard{Id: id, Authoritative: authoritative, SortOrder: sortOrder, Operator: operator, ResetScheduleStr: resetSchedule, Metadata: metadata, EnableRanks: enableRanks, MaxSize: 100000000, MaxNumScore: 1000000, StartTime: time.Now().UTC().Unix()}
 
-	// Then add to cache.
-	leaderboard := &Leaderboard{
-		Id:               id,
-		Authoritative:    authoritative,
-		SortOrder:        sortOrder,
-		Operator:         operator,
-		ResetScheduleStr: resetSchedule,
-		ResetSchedule:    expr,
-		Metadata:         metadata,
-		CreateTime:       createTime.Time.Unix(),
-		EnableRanks:      enableRanks,
-	}
+	return l.createMySQL(ctx, requested)
 
-	l.Lock()
-	if leaderboard, ok := l.leaderboards[id]; ok {
-		// Maybe multiple concurrent creations for this ID.
-		l.Unlock()
-		return leaderboard, false, nil
-	}
-	l.leaderboards[id] = leaderboard
-	l.allList = append(l.allList, leaderboard)
-	l.leaderboardList = append(l.leaderboardList, leaderboard)
-	l.Unlock()
-
-	return leaderboard, true, nil
 }
 
 func (l *LocalLeaderboardCache) Insert(id string, authoritative bool, sortOrder, operator int, resetSchedule, metadata string, createTime int64, enableRanks bool) {
@@ -521,7 +464,7 @@ func (l *LocalLeaderboardCache) List(limit int, cursor *LeaderboardListCursor) (
 }
 
 func (l *LocalLeaderboardCache) CreateTournament(ctx context.Context, id string, authoritative bool, sortOrder, operator int, resetSchedule, metadata, title, description string, category, startTime, endTime, duration, maxSize, maxNumScore int, joinRequired, enableRanks bool) (*Leaderboard, bool, error) {
-	resetCron, err := checkTournamentConfig(resetSchedule, startTime, endTime, duration, maxSize, maxNumScore)
+	_, err := checkTournamentConfig(resetSchedule, startTime, endTime, duration, maxSize, maxNumScore)
 	if err != nil {
 		l.logger.Error("Error while creating tournament", zap.Error(err))
 		return nil, false, err
@@ -539,146 +482,25 @@ func (l *LocalLeaderboardCache) CreateTournament(ctx context.Context, id string,
 		return nil, false, fmt.Errorf("cannot create tournament as leaderboard is already in use")
 	}
 
-	params := []any{id, authoritative, sortOrder, operator, duration}
-	columns := "id, authoritative, sort_order, operator, duration"
-	values := "$1, $2, $3, $4, $5"
-
-	if resetSchedule != "" {
-		params = append(params, resetSchedule)
-		columns += ", reset_schedule"
-		values += ", $" + strconv.Itoa(len(params))
+	if metadata == "" {
+		metadata = "{}"
 	}
-
-	if metadata != "" {
-		params = append(params, metadata)
-		columns += ", metadata"
-		values += ", $" + strconv.Itoa(len(params))
-	}
-
-	if category >= 0 {
-		params = append(params, category)
-		columns += ", category"
-		values += ", $" + strconv.Itoa(len(params))
-	}
-
-	if description != "" {
-		params = append(params, description)
-		columns += ", description"
-		values += ", $" + strconv.Itoa(len(params))
-	}
-
-	if endTime > 0 {
-		params = append(params, time.Unix(int64(endTime), 0).UTC())
-		columns += ", end_time"
-		values += ", $" + strconv.Itoa(len(params))
-	}
-
-	if joinRequired {
-		params = append(params, joinRequired)
-		columns += ", join_required"
-		values += ", $" + strconv.Itoa(len(params))
-	}
-
 	if maxSize == 0 {
 		maxSize = math.MaxInt32
 	}
-	if maxSize > 0 {
-		params = append(params, maxSize)
-		columns += ", max_size"
-		values += ", $" + strconv.Itoa(len(params))
+	if maxNumScore == 0 {
+		maxNumScore = 1000000
 	}
-
-	if maxNumScore > 0 {
-		params = append(params, maxNumScore)
-		columns += ", max_num_score"
-		values += ", $" + strconv.Itoa(len(params))
+	if startTime == 0 {
+		startTime = int(time.Now().UTC().Unix())
 	}
-
-	if title != "" {
-		params = append(params, title)
-		columns += ", title"
-		values += ", $" + strconv.Itoa(len(params))
+	if category < 0 {
+		category = 0
 	}
+	requested := &Leaderboard{Id: id, Authoritative: authoritative, SortOrder: sortOrder, Operator: operator, ResetScheduleStr: resetSchedule, Metadata: metadata, EnableRanks: enableRanks, Category: category, Description: description, Duration: duration, EndTime: int64(endTime), JoinRequired: joinRequired, MaxSize: maxSize, MaxNumScore: maxNumScore, Title: title, StartTime: int64(startTime)}
 
-	if startTime > 0 {
-		params = append(params, time.Unix(int64(startTime), 0).UTC())
-		columns += ", start_time"
-		values += ", $" + strconv.Itoa(len(params))
-	}
+	return l.createMySQL(ctx, requested)
 
-	if !enableRanks {
-		params = append(params, enableRanks)
-		columns += ", enable_ranks"
-		values += ", $" + strconv.Itoa(len(params))
-	}
-
-	query := "INSERT INTO leaderboard (" + columns + ") VALUES (" + values + ") RETURNING metadata, max_size, max_num_score, create_time, start_time, end_time"
-
-	var dbMetadata string
-	var dbMaxSize int
-	var dbMaxNumScore int
-	var createTime pgtype.Timestamptz
-	var dbStartTime pgtype.Timestamptz
-	var dbEndTime pgtype.Timestamptz
-	err = l.db.QueryRowContext(ctx, query, params...).Scan(&dbMetadata, &dbMaxSize, &dbMaxNumScore, &createTime, &dbStartTime, &dbEndTime)
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
-			// Concurrent attempt at creating the tournament, to keep idempotency query the existing tournament data.
-			if err = l.db.QueryRowContext(ctx, "SELECT authoritative, sort_order, operator, COALESCE(reset_schedule, ''), metadata, category, description, duration, join_required, title, max_size, max_num_score, create_time, start_time, end_time FROM leaderboard WHERE id = $1", id).Scan(&authoritative, &sortOrder, &operator, &resetSchedule, &dbMetadata, &category, &description, &duration, &joinRequired, &title, &dbMaxSize, &dbMaxNumScore, &createTime, &dbStartTime, &dbEndTime); err != nil {
-				l.logger.Error("Error retrieving tournament", zap.Error(err))
-				return nil, false, err
-			}
-			if resetSchedule != "" {
-				resetCron, err = cronexpr.Parse(resetSchedule)
-				if err != nil {
-					l.logger.Error("Error parsing tournament reset schedule", zap.Error(err))
-					return nil, false, err
-				}
-			}
-		} else {
-			l.logger.Error("Error creating tournament", zap.Error(err))
-			return nil, false, err
-		}
-	}
-
-	leaderboard = &Leaderboard{
-		Id:               id,
-		Authoritative:    authoritative,
-		SortOrder:        sortOrder,
-		Operator:         operator,
-		ResetScheduleStr: resetSchedule,
-		ResetSchedule:    resetCron,
-		Metadata:         dbMetadata,
-		CreateTime:       createTime.Time.Unix(),
-		Category:         category,
-		Description:      description,
-		Duration:         duration,
-		EndTime:          0,
-		JoinRequired:     joinRequired,
-		MaxSize:          dbMaxSize,
-		MaxNumScore:      dbMaxNumScore,
-		Title:            title,
-		StartTime:        dbStartTime.Time.Unix(),
-		EnableRanks:      enableRanks,
-	}
-	if dbEndTime.Valid {
-		leaderboard.EndTime = dbEndTime.Time.Unix()
-	}
-
-	l.Lock()
-	if leaderboard, ok := l.leaderboards[id]; ok {
-		// Maybe multiple concurrent creations for this ID.
-		l.Unlock()
-		return leaderboard, false, nil
-	}
-	l.leaderboards[id] = leaderboard
-	l.allList = append(l.allList, leaderboard)
-	l.tournamentList = append(l.tournamentList, leaderboard)
-	sort.Sort(OrderedTournaments(l.tournamentList))
-	l.Unlock()
-
-	return leaderboard, true, nil
 }
 
 func (l *LocalLeaderboardCache) InsertTournament(id string, authoritative bool, sortOrder, operator int, resetSchedule, metadata, title, description string, category, duration, maxSize, maxNumScore int, joinRequired bool, createTime, startTime, endTime int64, enableRanks bool) {
@@ -808,7 +630,7 @@ func (l *LocalLeaderboardCache) Delete(ctx context.Context, rankCache Leaderboar
 	}
 
 	// Delete from database first.
-	query := "DELETE FROM leaderboard WHERE id = $1"
+	query := "DELETE FROM leaderboard WHERE id = ?"
 	res, err := l.db.ExecContext(ctx, query, id)
 	if err != nil {
 		l.logger.Error("Error deleting leaderboard", zap.Error(err))

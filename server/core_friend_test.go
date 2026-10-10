@@ -15,6 +15,7 @@ func TestServer_ListFriendsOfFriends(t *testing.T) {
 
 	sessionRegistry := NewLocalSessionRegistry(metrics)
 	statusRegistry := NewLocalStatusRegistry(logger, cfg, sessionRegistry, protojsonMarshaler)
+	t.Cleanup(statusRegistry.Stop)
 
 	// user
 	uid := uuid.Must(uuid.NewV4())
@@ -45,58 +46,21 @@ func TestServer_ListFriendsOfFriends(t *testing.T) {
 	InsertUser(t, db, uidB2)
 	InsertUser(t, db, uidB3)
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := addFriend(ctx, logger, tx, uid, uidA1.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidA1, uid.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidA1, uidA2.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidA2, uidA1.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidA1, uidA3.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidA3, uidA1.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := addFriend(ctx, logger, tx, uid, uidB1.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidB1, uid.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidB1, uidB2.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidB2, uidB1.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidB1, uidB3.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidB3, uidB1.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := addFriend(ctx, logger, tx, uid, uidB3.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := addFriend(ctx, logger, tx, uidB3, uid.String(), ""); err != nil {
-		t.Fatal(err)
-	}
-
-	if err = tx.Commit(); err != nil {
-		t.Fatal(err)
+	// Use the public core so fixtures follow the selected database backend.
+	for _, pair := range [][2]uuid.UUID{
+		{uid, uidA1},
+		{uidA1, uidA2},
+		{uidA1, uidA3},
+		{uid, uidB1},
+		{uidB1, uidB2},
+		{uidB1, uidB3},
+		{uid, uidB3},
+	} {
+		for _, edge := range [][2]uuid.UUID{pair, {pair[1], pair[0]}} {
+			if err := AddFriends(ctx, logger, db, &friendTracker{}, nil, edge[0], "fixture", []string{edge[1].String()}, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 
 	t.Run("returns friends of friends, excluding friends in common", func(t *testing.T) {

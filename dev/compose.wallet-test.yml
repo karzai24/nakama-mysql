@@ -1,0 +1,5 @@
+# Local test fixture only, enabled temporarily by dev/wallet.sh.
+services:
+  nakama:
+    volumes:
+      - ./dev/wallet_module:/nakama/data/modules:ro

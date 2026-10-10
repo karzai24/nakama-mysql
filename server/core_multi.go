@@ -20,7 +20,7 @@ import (
 
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
-	"github.com/jackc/pgx/v5"
+
 	"go.uber.org/zap"
 )
 
@@ -29,50 +29,35 @@ func MultiUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, metrics Me
 		return nil, nil, nil
 	}
 
-	var storageWriteAcks []*api.StorageObjectAck
-	var storageWriteOps StorageOpWrites
-	var walletUpdateResults []*runtime.WalletUpdateResult
+	return multiUpdateMySQL(ctx, db, metrics, accountUpdates, storageWrites, storageDeletes, storageIndex, walletUpdates, updateLedger)
 
-	if err := ExecuteInTxPgx(ctx, db, func(tx pgx.Tx) error {
-		storageWriteAcks = nil
-		walletUpdateResults = nil
+}
 
-		// Execute any account updates.
-		updateErr := updateAccounts(ctx, logger, tx, accountUpdates)
-		if updateErr != nil {
-			return updateErr
-		}
-
-		// Execute any storage updates.
-		storageWriteOps, storageWriteAcks, updateErr = storageWriteObjects(ctx, logger, metrics, tx, true, storageWrites)
-		if updateErr != nil {
-			return updateErr
-		}
-
-		// Execute any storage deletes.
-		deleteErr := storageDeleteObjects(ctx, logger, tx, true, storageDeletes)
-		if deleteErr != nil {
-			return deleteErr
-		}
-
-		// Execute any wallet updates.
-		walletUpdateResults, updateErr = updateWallets(ctx, logger, tx, walletUpdates, updateLedger)
-		if updateErr != nil {
-			return updateErr
-		}
-
-		return nil
-	}); err != nil {
-		if e, ok := err.(*statusError); ok {
-			return nil, walletUpdateResults, e.Cause()
-		}
-		logger.Error("Error running multi update.", zap.Error(err))
-		return nil, walletUpdateResults, err
+func publishMultiUpdateIndex(ctx context.Context, index StorageIndex, objects []*api.StorageObject, removed StorageOpDeletes) {
+	// Publish only the final committed state. A write followed by a delete of the
+	// same object must not briefly reinsert that object into an index after commit.
+	deleted := map[[3]string]bool{}
+	for _, op := range removed {
+		deleted[[3]string{op.OwnerID, op.ObjectID.Collection, op.ObjectID.Key}] = true
 	}
-
-	// Update storage index.
-	storageIndexWrite(ctx, storageIndex, storageWriteOps, storageWriteAcks)
-	storageIndex.Delete(ctx, storageDeletes)
-
-	return storageWriteAcks, walletUpdateResults, nil
+	final := make([]*api.StorageObject, 0, len(objects))
+	positions := map[[3]string]int{}
+	for _, object := range objects {
+		key := [3]string{object.UserId, object.Collection, object.Key}
+		if deleted[key] {
+			continue
+		}
+		if position, exists := positions[key]; exists {
+			final[position] = object
+		} else {
+			positions[key] = len(final)
+			final = append(final, object)
+		}
+	}
+	if len(final) > 0 {
+		index.Write(ctx, final)
+	}
+	if len(removed) > 0 {
+		index.Delete(ctx, removed)
+	}
 }

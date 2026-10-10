@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+**/*.pem
+**/*.key
+**/node_modules
+.DS_Store
+
+# Disposable parity run evidence (may include synthetic credentials).
+.parity-results/

@@ -57,7 +57,7 @@ var baseFuncs = map[string]LGFunction{
 
 func baseAssert(L *LState) int {
 	if !L.ToBool(1) {
-		L.RaiseError(L.OptString(2, "assertion failed!"))
+		L.RaiseError("%s", L.OptString(2, "assertion failed!"))
 		return 0
 	}
 	return L.GetTop()

@@ -18,13 +18,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgerrcode"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-)
-
-const (
-	dbErrorUniqueViolation = pgerrcode.UniqueViolation
 )
 
 var ErrRowsAffectedCount = errors.New("rows_affected_count")
@@ -121,7 +116,7 @@ func newTxnRestartError(err error, retryErr error) *TxnRestartError {
 	const msgPattern = "restarting txn failed. ROLLBACK TO SAVEPOINT " +
 		"encountered error: %s. Original error: %s."
 	return &TxnRestartError{
-		cause:      err,
+		txError:    txError{cause: err},
 		retryCause: retryErr,
 		msg:        fmt.Sprintf(msgPattern, err, retryErr),
 	}

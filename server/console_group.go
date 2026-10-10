@@ -20,22 +20,18 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
-	"errors"
-	"strconv"
+
 	"strings"
-	"time"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
-	"github.com/heroiclabs/nakama-common/rtapi"
+
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 type consoleGroupCursor struct {
@@ -62,61 +58,7 @@ func (s *ConsoleServer) ListGroups(ctx context.Context, in *console.ListGroupsRe
 		}
 	}
 
-	buildListGroupsQuery := func(cursor *consoleGroupCursor, filter string) (query string, params []any, limit int) {
-		// Check if we have a filter and it's a group ID.
-		var groupIDFilter *uuid.UUID
-		if filter != "" {
-			groupID, err := uuid.FromString(filter)
-			if err == nil {
-				groupIDFilter = &groupID
-			}
-		}
-
-		limit = defaultLimit
-		switch {
-		case groupIDFilter != nil:
-			// Filtering for a single exact group ID. Querying on primary key (id).
-			query = `SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
-FROM groups WHERE id = $1`
-			params = []any{*groupIDFilter}
-			limit = 0
-		// Pagination not possible.
-		case filter != "" && strings.Contains(filter, "%"):
-			// Filtering for a partial username. Querying and paginating on unique index (name).
-			query = `SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
-FROM groups WHERE name ILIKE $1`
-			params = []any{filter}
-			// Pagination is possible.
-			if cursor != nil {
-				query += " AND name > $2"
-				params = append(params, cursor.Name)
-			}
-			// Order and limit.
-			params = append(params, limit+1)
-			query += "ORDER BY name ASC LIMIT $" + strconv.Itoa(len(params))
-		case filter != "":
-			// Filtering for an exact username. Querying on unique index (name).
-			query = `SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
-FROM groups WHERE name = $1`
-			params = []any{filter}
-			limit = 0
-		// Pagination not possible.
-		case cursor != nil:
-			// Non-filtered, but paginated query. Assume pagination on group ID. Querying and paginating on primary key (id).
-			query = `SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
-FROM groups WHERE id > $1 ORDER BY id ASC LIMIT $2`
-			params = []any{cursor.ID, limit + 1}
-		default:
-			// Non-filtered, non-paginated query. Querying and paginating on primary key (id).
-			query = `SELECT id, creator_id, name, description, avatar_url, state, edge_count, lang_tag, max_count, metadata, create_time, update_time
-FROM groups ORDER BY id ASC LIMIT $1`
-			params = []any{limit + 1}
-		}
-
-		return query, params, limit
-	}
-
-	query, params, limit := buildListGroupsQuery(cursor, in.Filter)
+	query, params, limit := consoleGroupsQueryMySQL(in.Filter, cursor)
 
 	rows, err := s.db.QueryContext(ctx, query, params...)
 	if err != nil {
@@ -147,6 +89,10 @@ FROM groups ORDER BY id ASC LIMIT $1`
 		previousGroup = group
 	}
 	_ = rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	response := &console.GroupList{
 		Groups:     groups,
@@ -273,134 +219,16 @@ func (s *ConsoleServer) DemoteGroupMember(ctx context.Context, in *console.Updat
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid group ID.")
 	}
 
-	demoteGroupUser := func(ctx context.Context, logger *zap.Logger, db *sql.DB, router MessageRouter, caller uuid.UUID, groupID uuid.UUID, uid uuid.UUID) error {
-		myState := 0
-		if caller != uuid.Nil {
-			var dbState sql.NullInt64
-			query := "SELECT state FROM group_edge WHERE source_id = $1::UUID AND destination_id = $2::UUID"
-			if err := db.QueryRowContext(ctx, query, groupID, caller).Scan(&dbState); err != nil {
-				if err == sql.ErrNoRows {
-					logger.Info("Could not retrieve state as no group relationship exists.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-					return runtime.ErrGroupPermissionDenied
-				}
-				logger.Error("Could not retrieve state from group_edge.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-				return err
+	{
+		if err := mutateGroupMySQL(ctx, logger, s.db, s.tracker, s.router, nil, uuid.Nil, groupID, []uuid.UUID{userID}, "", "console_demote", true); err != nil {
+			if err == ErrEmptyMemberDemote || err == ErrEmptyMemberPromote {
+				return nil, status.Error(codes.FailedPrecondition, "Cannot demote user in the group.")
 			}
-
-			myState = int(dbState.Int64)
-			if myState > 1 {
-				logger.Info("Cannot demote users as user does not have correct permissions.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()), zap.Int("state", myState))
-				return runtime.ErrGroupPermissionDenied
-			}
+			return nil, status.Error(codes.Internal, "Could not demote group member.")
 		}
-
-		var groupExists sql.NullBool
-		query := "SELECT EXISTS (SELECT id FROM groups WHERE id = $1 AND disable_time = '1970-01-01 00:00:00 UTC')"
-		err := db.QueryRowContext(ctx, query, groupID).Scan(&groupExists)
-		if err != nil {
-			logger.Error("Could not look up group when demoting users.", zap.Error(err), zap.String("group_id", groupID.String()))
-			return err
-		}
-		if !groupExists.Bool {
-			logger.Info("Cannot demote users in a disabled group.", zap.String("group_id", groupID.String()))
-			return runtime.ErrGroupNotFound
-		}
-
-		// Prepare the messages we'll need to send to the group channel.
-		stream := PresenceStream{
-			Mode:    StreamModeGroup,
-			Subject: groupID,
-		}
-		channelID, err := StreamToChannelId(stream)
-		if err != nil {
-			logger.Error("Could not create channel ID.", zap.Error(err))
-			return err
-		}
-
-		if uid == caller {
-			return errors.New("cannot demote self")
-		}
-
-		var message *api.ChannelMessage
-		ts := time.Now().Unix()
-
-		if err := ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
-			query := ""
-			if myState == 0 {
-				// Ensure we aren't removing the last superadmin when deleting authoritatively.
-				// Query is for superadmin or if done authoritatively.
-				query = `
-UPDATE group_edge SET state = state + 1
-WHERE
-  (
-    (source_id = $1::UUID AND destination_id = $2::UUID AND state >= $3 AND state < $4)
-    OR
-    (source_id = $2::UUID AND destination_id = $1::UUID AND state >= $3 AND state < $4)
-  )
-AND
-  (
-    (SELECT COUNT(destination_id) FROM group_edge WHERE source_id = $1::UUID AND destination_id != $2::UUID AND state = 0) > 0
-  )
-RETURNING state`
-			}
-
-			var newState sql.NullInt64
-			if err := tx.QueryRowContext(ctx, query, groupID, uid, myState, api.GroupUserList_GroupUser_MEMBER).Scan(&newState); err != nil {
-				if err == sql.ErrNoRows {
-					return ErrEmptyMemberDemote
-				}
-				logger.Debug("Could not demote user in group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-				return err
-			}
-
-			// Look up the username.
-			var username sql.NullString
-			query = "SELECT username FROM users WHERE id = $1::UUID"
-			if err := tx.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
-				if err == sql.ErrNoRows {
-					return runtime.ErrGroupUserNotFound
-				}
-				logger.Debug("Could not retrieve username to demote user in group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-				return err
-			}
-
-			message = &api.ChannelMessage{
-				ChannelId:  channelID,
-				MessageId:  uuid.Must(uuid.NewV4()).String(),
-				Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupDemote},
-				SenderId:   uid.String(),
-				Username:   username.String,
-				Content:    "{}",
-				CreateTime: &timestamppb.Timestamp{Seconds: ts},
-				UpdateTime: &timestamppb.Timestamp{Seconds: ts},
-				Persistent: &wrapperspb.BoolValue{Value: true},
-				GroupId:    groupID.String(),
-			}
-
-			query = `INSERT INTO message (id, code, sender_id, username, stream_mode, stream_subject, stream_descriptor, stream_label, content, create_time, update_time)
-VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
-			if _, err := tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
-				logger.Debug("Could not insert group demote channel message.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-				return err
-			}
-			return nil
-		}); err != nil {
-			if err != ErrEmptyMemberDemote {
-				logger.Error("Error demoting users in group.", zap.Error(err), zap.String("group_id", groupID.String()))
-			}
-			return err
-		}
-		router.SendToStream(logger, stream, &rtapi.Envelope{Message: &rtapi.Envelope_ChannelMessage{ChannelMessage: message}}, true)
-		return nil
+		return &emptypb.Empty{}, nil
 	}
 
-	if err = demoteGroupUser(ctx, logger, s.db, s.router, uuid.Nil, groupID, userID); err != nil {
-		if err == ErrEmptyMemberDemote {
-			return nil, status.Error(codes.FailedPrecondition, "Cannot demote user in the group.")
-		}
-		return nil, status.Error(codes.Internal, "An error occurred while trying to demote the user in the group.")
-	}
-	return &emptypb.Empty{}, nil
 }
 
 func (s *ConsoleServer) PromoteGroupMember(ctx context.Context, in *console.UpdateGroupUserStateRequest) (*emptypb.Empty, error) {
@@ -414,135 +242,16 @@ func (s *ConsoleServer) PromoteGroupMember(ctx context.Context, in *console.Upda
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid group ID.")
 	}
 
-	promoteGroupUser := func(ctx context.Context, logger *zap.Logger, db *sql.DB, router MessageRouter, caller uuid.UUID, groupID uuid.UUID, uid uuid.UUID) error {
-		//myState, tx, err := preGroupUserStateChangeValidate(ctx, logger, db, groupID, caller)
-		//if err != nil {
-		//	return err
-		//}
-		myState := 0
-		if caller != uuid.Nil {
-			var dbState sql.NullInt64
-			query := "SELECT state FROM group_edge WHERE source_id = $1::UUID AND destination_id = $2::UUID"
-			if err := db.QueryRowContext(ctx, query, groupID, caller).Scan(&dbState); err != nil {
-				if err == sql.ErrNoRows {
-					logger.Info("Could not retrieve state as no group relationship exists.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-					return runtime.ErrGroupPermissionDenied
-				}
-				logger.Error("Could not retrieve state from group_edge.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()))
-				return err
+	{
+		if err := mutateGroupMySQL(ctx, logger, s.db, s.tracker, s.router, nil, uuid.Nil, groupID, []uuid.UUID{userID}, "", "console_promote", true); err != nil {
+			if err == ErrEmptyMemberDemote || err == ErrEmptyMemberPromote {
+				return nil, status.Error(codes.FailedPrecondition, "Cannot promote user in the group.")
 			}
-
-			myState = int(dbState.Int64)
-			if myState > 1 {
-				logger.Info("Cannot promote users as user does not have correct permissions.", zap.String("group_id", groupID.String()), zap.String("user_id", caller.String()), zap.Int("state", myState))
-				return runtime.ErrGroupPermissionDenied
-			}
+			return nil, status.Error(codes.Internal, "Could not promote group member.")
 		}
-
-		var groupExists sql.NullBool
-		query := "SELECT EXISTS (SELECT id FROM groups WHERE id = $1 AND disable_time = '1970-01-01 00:00:00 UTC')"
-		err := db.QueryRowContext(ctx, query, groupID).Scan(&groupExists)
-		if err != nil {
-			logger.Error("Could not look up group when promoting users.", zap.Error(err), zap.String("group_id", groupID.String()))
-			return err
-		}
-		if !groupExists.Bool {
-			logger.Info("Cannot promote users in a disabled group.", zap.String("group_id", groupID.String()))
-			return runtime.ErrGroupNotFound
-		}
-
-		// Prepare the messages we'll need to send to the group channel.
-		stream := PresenceStream{
-			Mode:    StreamModeGroup,
-			Subject: groupID,
-		}
-		channelID, err := StreamToChannelId(stream)
-		if err != nil {
-			logger.Error("Could not create channel ID.", zap.Error(err))
-			return err
-		}
-
-		var message *api.ChannelMessage
-		ts := time.Now().Unix()
-
-		if err := ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
-			if uid == caller {
-				return errors.New("cannot promote self")
-			}
-
-			query := `
-UPDATE group_edge SET state = state - 1
-WHERE
-	(source_id = $1::UUID AND destination_id = $2::UUID AND state > 0 AND state > $3)
-OR
-	(source_id = $2::UUID AND destination_id = $1::UUID AND state > 0 AND state > $3)
-RETURNING state`
-
-			var newState sql.NullInt64
-			if err := tx.QueryRowContext(ctx, query, groupID, uid, myState).Scan(&newState); err != nil {
-				if err == sql.ErrNoRows {
-					return ErrEmptyMemberPromote
-				}
-				logger.Debug("Could not promote user in group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-				return err
-			}
-
-			if newState.Int64 == 2 {
-				err := incrementGroupEdge(ctx, logger, tx, uid, groupID)
-				if err != nil {
-					return err
-				}
-			}
-
-			// Look up the username.
-			var username sql.NullString
-			query = "SELECT username FROM users WHERE id = $1::UUID"
-			if err := tx.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
-				if err == sql.ErrNoRows {
-					return runtime.ErrGroupUserNotFound
-				}
-				logger.Debug("Could not retrieve username to promote user in group.", zap.Error(err), zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-				return err
-			}
-
-			message = &api.ChannelMessage{
-				ChannelId:  channelID,
-				MessageId:  uuid.Must(uuid.NewV4()).String(),
-				Code:       &wrapperspb.Int32Value{Value: ChannelMessageTypeGroupPromote},
-				SenderId:   uid.String(),
-				Username:   username.String,
-				Content:    "{}",
-				CreateTime: &timestamppb.Timestamp{Seconds: ts},
-				UpdateTime: &timestamppb.Timestamp{Seconds: ts},
-				Persistent: &wrapperspb.BoolValue{Value: true},
-				GroupId:    groupID.String(),
-			}
-
-			query = `INSERT INTO message (id, code, sender_id, username, stream_mode, stream_subject, stream_descriptor, stream_label, content, create_time, update_time)
-VALUES ($1, $2, $3, $4, $5, $6::UUID, $7::UUID, $8, $9, $10, $10)`
-			if _, err := tx.ExecContext(ctx, query, message.MessageId, message.Code.Value, message.SenderId, message.Username, stream.Mode, stream.Subject, stream.Subcontext, stream.Label, message.Content, time.Unix(message.CreateTime.Seconds, 0).UTC()); err != nil {
-				logger.Debug("Could not insert group demote channel message.", zap.String("group_id", groupID.String()), zap.String("user_id", uid.String()))
-				return err
-			}
-			return nil
-		}); err != nil {
-			if err != ErrEmptyMemberPromote {
-				logger.Error("Error promoting users in group.", zap.Error(err), zap.String("group_id", groupID.String()))
-			}
-			return err
-		}
-		router.SendToStream(logger, stream, &rtapi.Envelope{Message: &rtapi.Envelope_ChannelMessage{ChannelMessage: message}}, true)
-		return nil
+		return &emptypb.Empty{}, nil
 	}
 
-	if err = promoteGroupUser(ctx, logger, s.db, s.router, uuid.Nil, groupID, userID); err != nil {
-		if err == ErrEmptyMemberPromote {
-			return nil, status.Error(codes.FailedPrecondition, "Cannot promote user in the group.")
-		}
-		return nil, status.Error(codes.Internal, "An error occurred while trying to promote the user in the group.")
-	}
-
-	return &emptypb.Empty{}, nil
 }
 
 func (s *ConsoleServer) AddGroupUsers(ctx context.Context, in *console.AddGroupUsersRequest) (*emptypb.Empty, error) {
@@ -566,7 +275,7 @@ func (s *ConsoleServer) AddGroupUsers(ctx context.Context, in *console.AddGroupU
 		for _, uid := range uuids {
 			// Look up the username, and implicitly if this user exists.
 			var username sql.NullString
-			query := "SELECT username FROM users WHERE id = $1::UUID"
+			query := "SELECT username FROM users WHERE id = ?"
 			if err = s.db.QueryRowContext(ctx, query, uid).Scan(&username); err != nil {
 				if err == sql.ErrNoRows {
 					return nil, status.Error(codes.InvalidArgument, "User not found: "+uid.String()+". Refresh the page to see any updates.")

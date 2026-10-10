@@ -1,3 +1,4 @@
+// Modified by nakama-mysql contributors: native MySQL account lifecycle integration.
 // Copyright 2018 The Nakama Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,9 +19,9 @@ import (
 	"context"
 	"errors"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
-	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -95,7 +96,7 @@ func (s *ApiServer) DeleteAccount(ctx context.Context, in *emptypb.Empty) (*empt
 		}
 	}
 
-	if err := DeleteAccount(ctx, logger, s.db, s.config, s.leaderboardCache, s.leaderboardRankCache, s.sessionRegistry, s.sessionCache, s.tracker, userID, false); err != nil {
+	if err := DeleteAccount(ctx, logger, s.db, s.config, s.leaderboardCache, s.leaderboardRankCache, s.sessionRegistry, s.sessionCache, s.tracker, userID, false, s.storageIndex); err != nil {
 		if errors.Is(err, ErrAccountNotFound) {
 			return nil, status.Error(codes.NotFound, "Account not found.")
 		}
@@ -160,7 +161,8 @@ func (s *ApiServer) UpdateAccount(ctx context.Context, in *api.UpdateAccountRequ
 		metadata:    nil,
 	}})
 	if err != nil {
-		if _, ok := errors.AsType[*pgconn.PgError](err); ok {
+		var dbErr *mysql.MySQLError
+		if errors.As(err, &dbErr) {
 			return nil, status.Error(codes.Internal, "Error while trying to update account.")
 		}
 		return nil, status.Error(codes.InvalidArgument, err.Error())
